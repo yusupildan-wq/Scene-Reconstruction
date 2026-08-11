@@ -27,8 +27,10 @@ job_status_enum = postgresql.ENUM(
 
 
 def upgrade() -> None:
-    job_status_enum.create(op.get_bind(), checkfirst=True)
-
+    # Not calling job_status_enum.create() explicitly here: op.create_table below
+    # already creates the ENUM type as part of creating the "jobs" table's status
+    # column, and Alembic's create_table does that unconditionally (no existence
+    # check) -- calling .create() first caused a duplicate "CREATE TYPE" collision.
     op.create_table(
         "projects",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),

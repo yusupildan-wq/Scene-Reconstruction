@@ -34,7 +34,10 @@ class Job(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id"))
-    status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.PENDING)
+    status: Mapped[JobStatus] = mapped_column(
+        Enum(JobStatus, values_callable=lambda enum_cls: [member.value for member in enum_cls]),
+        default=JobStatus.PENDING,
+    )
     stage_detail: Mapped[str | None] = mapped_column(String(255), default=None)
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
 
