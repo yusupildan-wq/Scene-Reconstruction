@@ -1,0 +1,34 @@
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict
+
+from app.models import JobStatus
+
+
+class ProjectCreate(BaseModel):
+    name: str
+
+
+class ProjectOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+
+
+class JobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    status: JobStatus
+    stage_detail: str | None
+    error_message: str | None
+    frame_count: int | None
+    selected_frame_count: int | None
+    output_storage_key: str | None
+    metrics: dict | None
+    created_at: datetime
+    updated_at: datetime
