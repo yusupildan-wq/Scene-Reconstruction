@@ -5,9 +5,9 @@ import SceneViewer from "./SceneViewer";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
-  const [sceneChoice, setSceneChoice] = useState<"demo_scene.json" | "real_scene.json">(
-    "real_scene.json"
-  );
+  const [sceneChoice, setSceneChoice] = useState<
+    "demo_scene.json" | "real_scene.json" | "dust3r_scene.bin"
+  >("dust3r_scene.bin");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
@@ -70,7 +70,8 @@ export default function App() {
             onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
             style={{ marginBottom: 12 }}
           >
-            <option value="real_scene.json">My room (real video, 3000 iterations)</option>
+            <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, V2)</option>
+            <option value="real_scene.json">My room (COLMAP + 6k iterations, V0)</option>
             <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>
           </select>
           <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
