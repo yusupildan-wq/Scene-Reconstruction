@@ -89,7 +89,7 @@ def _init_gaussians_from_sfm(recon: pycolmap.Reconstruction, device: torch.devic
     # the whole render as one giant blob covering everything else. Clip the
     # maximum too, relative to the scene's own distance distribution (95th
     # percentile) rather than a fixed number, since scene scale varies.
-    max_reasonable_dist = np.percentile(dists[:, 1], 95)
+    max_reasonable_dist = np.percentile(dists[:, 1], 90)
     nearest_neighbor_dist = np.clip(dists[:, 1], 1e-4, max_reasonable_dist)
 
     n = xyz.shape[0]
@@ -102,7 +102,11 @@ def _init_gaussians_from_sfm(recon: pycolmap.Reconstruction, device: torch.devic
     opacities = torch.full((n,), -2.0, device=device).requires_grad_(True)  # sigmoid(-2) ~= 0.12
     colors = torch.tensor(rgb, device=device).requires_grad_(True)
 
-    return means, quats, scales, opacities, colors
+    # Same bound used at init, reused during training to stop gradient descent from
+    # growing a few Gaussians huge again later (see train_gaussian_splatting).
+    max_log_scale = float(np.log(max_reasonable_dist))
+
+    return means, quats, scales, opacities, colors, max_log_scale
 
 
 def _colmap_camera_to_K(camera: pycolmap.Camera) -> np.ndarray:
@@ -133,7 +137,7 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
     device = torch.device("cuda")
     recon = sfm.reconstruction
 
-    means, quats, scales, opacities, colors = _init_gaussians_from_sfm(recon, device)
+    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_sfm(recon, device)
     optimizer = torch.optim.Adam(
         [
             {"params": [means], "lr": 1.6e-4},
@@ -183,6 +187,14 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # The init clip alone wasn't enough -- gradient descent found it "cheap"
+        # to reduce average pixel loss by growing a few Gaussians huge (covering
+        # big areas with one blob) instead of many small correctly-placed ones.
+        # Re-clamp after every step so that degenerate solution stays unavailable
+        # throughout training, not just prevented at the starting point.
+        with torch.no_grad():
+            scales.clamp_(max=max_log_scale)
 
     return {
         "means": means.detach().cpu().numpy(),
