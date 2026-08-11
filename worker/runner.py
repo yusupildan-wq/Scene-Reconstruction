@@ -83,7 +83,14 @@ def _init_gaussians_from_sfm(recon: pycolmap.Reconstruction, device: torch.devic
 
     tree = cKDTree(xyz)
     dists, _ = tree.query(xyz, k=2)
-    nearest_neighbor_dist = np.clip(dists[:, 1], 1e-4, None)
+    # Real SfM data (unlike the clean synthetic test scene) can have a handful of
+    # isolated outlier points whose nearest neighbor is very far away -- clipping
+    # only the minimum let those get a huge initial scale, which then dominates
+    # the whole render as one giant blob covering everything else. Clip the
+    # maximum too, relative to the scene's own distance distribution (95th
+    # percentile) rather than a fixed number, since scene scale varies.
+    max_reasonable_dist = np.percentile(dists[:, 1], 95)
+    nearest_neighbor_dist = np.clip(dists[:, 1], 1e-4, max_reasonable_dist)
 
     n = xyz.shape[0]
     means = torch.tensor(xyz, device=device).requires_grad_(True)
