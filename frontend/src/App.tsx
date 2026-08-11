@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { createJob, createProject, listJobs, listProjects, Job, Project } from "./api/client";
 import JobRow from "./JobRow";
+import SceneViewer from "./SceneViewer";
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
@@ -48,6 +50,24 @@ export default function App() {
     <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui, sans-serif" }}>
       <h1>Scene Reconstruction</h1>
 
+      <div style={{ marginBottom: 24 }}>
+        <button onClick={() => setActiveTab("demo")} disabled={activeTab === "demo"}>
+          Demo Scene
+        </button>{" "}
+        <button onClick={() => setActiveTab("projects")} disabled={activeTab === "projects"}>
+          Projects
+        </button>
+      </div>
+
+      {activeTab === "demo" && (
+        <section style={{ marginBottom: 32 }}>
+          <h2>Trained Gaussian Splat scene (Colab, 1000 iterations)</h2>
+          <SceneViewer sceneUrl="/demo_scene.json" />
+        </section>
+      )}
+
+      {activeTab === "projects" && (
+        <>
       <section style={{ marginBottom: 32 }}>
         <h2>Projects</h2>
         <form onSubmit={handleCreateProject} style={{ marginBottom: 12 }}>
@@ -94,6 +114,8 @@ export default function App() {
             ))}
           </ul>
         </section>
+      )}
+        </>
       )}
     </div>
   );
