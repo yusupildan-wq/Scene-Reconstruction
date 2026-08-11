@@ -78,7 +78,9 @@ async function loadJsonScene(url: string): Promise<FlatGaussianScene> {
 // point also gets its own size/alpha/color via per-vertex attributes, since stock
 // PointsMaterial only supports one uniform size for every point.
 const VERTEX_SHADER = `
-  attribute vec3 color;
+  // NOTE: no "attribute vec3 color" here -- THREE.ShaderMaterial with
+  // vertexColors: true auto-injects that declaration itself; redeclaring it
+  // is a GLSL compile error ("redefinition"), not a missing-declaration one.
   attribute float pointSize;
   attribute float pointAlpha;
   varying vec3 vColor;
