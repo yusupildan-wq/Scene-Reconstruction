@@ -153,11 +153,16 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
 
     for step in range(num_iterations):
         cam = cameras[step % len(cameras)]
+        # scales/opacities are stored unconstrained (log-scale, logit) so gradient
+        # descent can move them freely -- exp()/sigmoid() here converts them to the
+        # real positive-scale / 0-1-opacity values the renderer actually needs.
+        # Forgetting this step renders as solid black: raw negative "opacity" and
+        # near-zero/negative "scale" are both effectively invisible.
         render, _alpha, _meta = rasterization(
             means,
             quats,
-            scales,
-            opacities,
+            torch.exp(scales),
+            torch.sigmoid(opacities),
             colors,
             cam["viewmat"].unsqueeze(0),
             cam["K"].unsqueeze(0),
@@ -175,8 +180,8 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
     return {
         "means": means.detach().cpu().numpy(),
         "quats": quats.detach().cpu().numpy(),
-        "scales": scales.detach().cpu().numpy(),
-        "opacities": opacities.detach().cpu().numpy(),
+        "scales": torch.exp(scales).detach().cpu().numpy(),
+        "opacities": torch.sigmoid(opacities).detach().cpu().numpy(),
         "colors": colors.detach().cpu().numpy(),
     }
 
