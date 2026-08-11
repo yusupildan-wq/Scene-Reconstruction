@@ -6,13 +6,20 @@ payload -- the worker never touches storage credentials directly, only plain
 HTTP GET/PUT against temporary links (see backend/app/storage.py's presigned URL
 design).
 
-STATUS: run_colmap_sfm is proven correct -- it's the same pycolmap calls
-validated in experiments/sfm/run_sfm.py (16/16 cameras registered, ~1.2% pose
-error vs. ground truth on a synthetic scene). train_gaussian_splatting is
-UNVERIFIED: this machine has no CUDA GPU and gsplat requires one, so it has never
-actually been run. It's written against gsplat's real documented API and checked
-against pycolmap's real object shapes where possible, but treat it as a first
-draft to validate once real GPU access exists (RunPod), not proven-correct code.
+train_gaussian_splatting is deliberately decoupled from COLMAP: it only depends
+on ReconstructedScene (plain arrays), not on pycolmap types. That's what lets a
+different reconstruction backend -- e.g. a feed-forward model like DUSt3R --
+feed the same trainer, by producing a ReconstructedScene instead of running its
+own separate training code. See colmap_reconstruction_to_scene for how COLMAP's
+output gets converted into that shape.
+
+STATUS: run_colmap_sfm and train_gaussian_splatting have both been run
+successfully on real GPU hardware (Colab) against real phone video -- COLMAP
+registering real cameras, Gaussian Splatting training producing a real,
+inspectable result, adaptive density control genuinely growing Gaussian count.
+Known real limitation at this point: still far short of the density real
+room-scale splat scenes need for photorealism (thousands of Gaussians vs. the
+hundreds of thousands typical results use).
 """
 
 from __future__ import annotations
@@ -39,9 +46,39 @@ class JobPayload:
 
 
 @dataclass
-class SfmResult:
-    reconstruction: pycolmap.Reconstruction
-    images_dir: Path
+class ReconstructedScene:
+    """Backend-agnostic reconstruction output: plain arrays, no pycolmap types.
+
+    train_gaussian_splatting only depends on this, not on COLMAP or any specific
+    SfM implementation -- so DUSt3R (or anything else) can feed the same trainer
+    just by producing one of these, instead of needing its own training code.
+    """
+
+    points_xyz: np.ndarray  # (N, 3) float32
+    points_rgb: np.ndarray  # (N, 3) float32, in [0, 1]
+    camera_viewmats: list[np.ndarray]  # each (4, 4) float32, world-to-camera
+    camera_Ks: list[np.ndarray]  # each (3, 3) float32, intrinsics
+    camera_images: list[np.ndarray]  # each (H, W, 3) float32, in [0, 1]
+
+
+def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
+    """Adapter: pycolmap's specific object types -> the generic scene format
+    train_gaussian_splatting actually consumes."""
+    points = recon.points3D
+    points_xyz = np.array([p.xyz for p in points.values()], dtype=np.float32)
+    points_rgb = np.array([p.color for p in points.values()], dtype=np.float32) / 255.0
+
+    camera_viewmats, camera_Ks, camera_images = [], [], []
+    for image in recon.images.values():
+        if not image.has_pose:
+            continue
+        img_path = images_dir / image.name
+        pixels = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
+        camera_images.append(pixels)
+        camera_viewmats.append(_colmap_pose_to_viewmat(image))
+        camera_Ks.append(_colmap_camera_to_K(recon.camera(image.camera_id)))
+
+    return ReconstructedScene(points_xyz, points_rgb, camera_viewmats, camera_Ks, camera_images)
 
 
 def _download_frames(frame_urls: list[str], dest_dir: Path) -> None:
@@ -52,7 +89,7 @@ def _download_frames(frame_urls: list[str], dest_dir: Path) -> None:
         (dest_dir / f"frame_{i:04d}.jpg").write_bytes(response.content)
 
 
-def run_colmap_sfm(job: JobPayload, workdir: Path) -> SfmResult:
+def run_colmap_sfm(job: JobPayload, workdir: Path) -> ReconstructedScene:
     """Feature extraction -> matching -> sparse SfM (poses + sparse point cloud)."""
     images_dir = workdir / "images"
     _download_frames(job.frame_urls, images_dir)
@@ -69,18 +106,15 @@ def run_colmap_sfm(job: JobPayload, workdir: Path) -> SfmResult:
         raise RuntimeError("COLMAP failed to register any cameras for this video")
 
     best_id = max(reconstructions, key=lambda k: reconstructions[k].num_reg_images())
-    return SfmResult(reconstruction=reconstructions[best_id], images_dir=images_dir)
+    return colmap_reconstruction_to_scene(reconstructions[best_id], images_dir)
 
 
-def _init_gaussians_from_sfm(recon: pycolmap.Reconstruction, device: torch.device):
-    """Seed Gaussians from COLMAP's sparse point cloud: position/color come
-    straight from SfM's triangulated points, scale from each point's distance to
-    its nearest neighbor, rotation starts as identity, opacity starts partly
-    transparent -- standard 3DGS initialization, refined by training below."""
-    points = recon.points3D
-    xyz = np.array([p.xyz for p in points.values()], dtype=np.float32)
-    rgb = np.array([p.color for p in points.values()], dtype=np.float32) / 255.0
-
+def _init_gaussians_from_points(xyz: np.ndarray, rgb: np.ndarray, device: torch.device):
+    """Seed Gaussians from a sparse/dense 3D point cloud (from COLMAP or DUSt3R --
+    this function doesn't care which): position/color come straight from the
+    points, scale from each point's distance to its nearest neighbor, rotation
+    starts as identity, opacity starts partly transparent -- standard 3DGS
+    initialization, refined by training below."""
     tree = cKDTree(xyz)
     dists, _ = tree.query(xyz, k=2)
     # Real SfM data (unlike the clean synthetic test scene) can have a handful of
@@ -212,7 +246,7 @@ def _make_optimizer(means, quats, scales, opacities, colors):
 
 
 def train_gaussian_splatting(
-    sfm: SfmResult,
+    scene: ReconstructedScene,
     num_iterations: int = 3000,
     densify_from: int = 200,
     densify_until: int | None = None,
@@ -223,27 +257,27 @@ def train_gaussian_splatting(
     with adaptive density control (split/clone/prune) growing detail beyond
     SfM's original fixed point count -- see _densify_and_prune.
 
+    Backend-agnostic: only depends on ReconstructedScene's plain arrays, not on
+    COLMAP specifically -- DUSt3R (or anything else) can feed this the same way.
+
     UNVERIFIED -- see module docstring. Written against gsplat's documented API,
     never actually executed (no local CUDA GPU to run it on).
     """
     device = torch.device("cuda")
-    recon = sfm.reconstruction
     densify_until = num_iterations if densify_until is None else densify_until
 
-    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_sfm(recon, device)
+    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_points(
+        scene.points_xyz, scene.points_rgb, device
+    )
     optimizer = _make_optimizer(means, quats, scales, opacities, colors)
     xyz_grad_accum = torch.zeros(means.shape[0], device=device)
     xyz_grad_count = torch.zeros(means.shape[0], device=device)
 
     cameras = []
-    for image in recon.images.values():
-        if not image.has_pose:
-            continue
-        img_path = sfm.images_dir / image.name
-        pixels_np = np.asarray(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
+    for pixels_np, viewmat_np, K_np in zip(scene.camera_images, scene.camera_viewmats, scene.camera_Ks):
         pixels = torch.tensor(pixels_np, device=device)
-        viewmat = torch.tensor(_colmap_pose_to_viewmat(image), device=device)
-        K = torch.tensor(_colmap_camera_to_K(recon.camera(image.camera_id)), device=device)
+        viewmat = torch.tensor(viewmat_np, device=device)
+        K = torch.tensor(K_np, device=device)
         cameras.append({"pixels": pixels, "viewmat": viewmat, "K": K, "h": pixels.shape[0], "w": pixels.shape[1]})
 
     if not cameras:
@@ -327,8 +361,8 @@ def handler(event: dict) -> dict:
     )
 
     with tempfile.TemporaryDirectory() as tmp:
-        sfm = run_colmap_sfm(job, Path(tmp))
-        gaussians = train_gaussian_splatting(sfm)
+        scene = run_colmap_sfm(job, Path(tmp))
+        gaussians = train_gaussian_splatting(scene)
         return evaluate_and_upload(job, gaussians)
 
 

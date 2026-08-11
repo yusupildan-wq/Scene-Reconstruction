@@ -5,6 +5,9 @@ import SceneViewer from "./SceneViewer";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
+  const [sceneChoice, setSceneChoice] = useState<"demo_scene.json" | "real_scene.json">(
+    "real_scene.json"
+  );
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
@@ -61,8 +64,16 @@ export default function App() {
 
       {activeTab === "demo" && (
         <section style={{ marginBottom: 32 }}>
-          <h2>Trained Gaussian Splat scene (Colab, 1000 iterations)</h2>
-          <SceneViewer sceneUrl="/demo_scene.json" />
+          <h2>Trained Gaussian Splat scene</h2>
+          <select
+            value={sceneChoice}
+            onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
+            style={{ marginBottom: 12 }}
+          >
+            <option value="real_scene.json">My room (real video, 3000 iterations)</option>
+            <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>
+          </select>
+          <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
         </section>
       )}
 
