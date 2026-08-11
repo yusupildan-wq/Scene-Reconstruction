@@ -109,6 +109,78 @@ def _init_gaussians_from_sfm(recon: pycolmap.Reconstruction, device: torch.devic
     return means, quats, scales, opacities, colors, max_log_scale
 
 
+def _densify_and_prune(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    colors: torch.Tensor,
+    xyz_grad_accum: torch.Tensor,
+    xyz_grad_count: torch.Tensor,
+    max_log_scale: float,
+    device: torch.device,
+    grad_threshold: float = 0.0002,
+    prune_opacity_threshold: float = 0.005,
+):
+    """Adaptive density control: grow detail where training is struggling, remove
+    Gaussians that faded to near-invisible. This is what lets the scene end up
+    with more than the fixed number of points SfM originally gave it.
+
+    A Gaussian's *position* gradient tells us how much moving it would reduce
+    loss -- large accumulated gradient over many steps means it's being pulled
+    in inconsistent directions, a sign one Gaussian is trying (and failing) to
+    cover a region that really needs several. Small-and-struggling gets CLONED
+    (duplicated, so the copy can specialize); large-and-struggling gets SPLIT
+    into two smaller ones sampled near the original. Opacity near zero means a
+    Gaussian contributes almost nothing to any render -- PRUNED (removed).
+    """
+    avg_grad = xyz_grad_accum / xyz_grad_count.clamp(min=1)
+    real_scales = torch.exp(scales)
+    real_opacities = torch.sigmoid(opacities)
+
+    high_grad = avg_grad > grad_threshold
+    is_large = real_scales.max(dim=-1).values > 0.5 * np.exp(max_log_scale)
+    split_mask = high_grad & is_large
+    clone_mask = high_grad & ~is_large
+    prune_mask = real_opacities < prune_opacity_threshold
+
+    keep_mask = ~(split_mask | prune_mask)
+
+    new_means = [means[keep_mask]]
+    new_quats = [quats[keep_mask]]
+    new_scales = [scales[keep_mask]]
+    new_opacities = [opacities[keep_mask]]
+    new_colors = [colors[keep_mask]]
+
+    if clone_mask.any():
+        new_means.append(means[clone_mask])
+        new_quats.append(quats[clone_mask])
+        new_scales.append(scales[clone_mask])
+        new_opacities.append(opacities[clone_mask])
+        new_colors.append(colors[clone_mask])
+
+    if split_mask.any():
+        n_split = int(split_mask.sum().item())
+        # Two children per split Gaussian, offset randomly within roughly its own
+        # extent, scaled down (a standard 3DGS convention) so total coverage stays
+        # similar instead of ballooning.
+        for _ in range(2):
+            offset = torch.randn(n_split, 3, device=device) * real_scales[split_mask]
+            new_means.append((means[split_mask] + offset).detach())
+            new_quats.append(quats[split_mask].detach())
+            new_scales.append((scales[split_mask] - np.log(1.6)).detach())
+            new_opacities.append(opacities[split_mask].detach())
+            new_colors.append(colors[split_mask].detach())
+
+    means = torch.cat(new_means).detach().requires_grad_(True)
+    quats = torch.cat(new_quats).detach().requires_grad_(True)
+    scales = torch.cat(new_scales).detach().requires_grad_(True)
+    opacities = torch.cat(new_opacities).detach().requires_grad_(True)
+    colors = torch.cat(new_colors).detach().requires_grad_(True)
+
+    return means, quats, scales, opacities, colors
+
+
 def _colmap_camera_to_K(camera: pycolmap.Camera) -> np.ndarray:
     # Ignoring lens distortion params here (e.g. SIMPLE_RADIAL's k) for the first
     # version -- a real simplification, not an oversight; revisit if training
@@ -127,18 +199,8 @@ def _colmap_pose_to_viewmat(image: pycolmap.Image) -> np.ndarray:
     return viewmat
 
 
-def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict:
-    """Per-scene optimization: differentiable rasterization + photometric loss,
-    refining the SfM-initialized Gaussians against the real extracted frames.
-
-    UNVERIFIED -- see module docstring. Written against gsplat's documented API,
-    never actually executed (no local CUDA GPU to run it on).
-    """
-    device = torch.device("cuda")
-    recon = sfm.reconstruction
-
-    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_sfm(recon, device)
-    optimizer = torch.optim.Adam(
+def _make_optimizer(means, quats, scales, opacities, colors):
+    return torch.optim.Adam(
         [
             {"params": [means], "lr": 1.6e-4},
             {"params": [quats], "lr": 1e-3},
@@ -147,6 +209,31 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
             {"params": [colors], "lr": 2.5e-3},
         ]
     )
+
+
+def train_gaussian_splatting(
+    sfm: SfmResult,
+    num_iterations: int = 3000,
+    densify_from: int = 200,
+    densify_until: int | None = None,
+    densify_interval: int = 300,
+) -> dict:
+    """Per-scene optimization: differentiable rasterization + photometric loss,
+    refining the SfM-initialized Gaussians against the real extracted frames,
+    with adaptive density control (split/clone/prune) growing detail beyond
+    SfM's original fixed point count -- see _densify_and_prune.
+
+    UNVERIFIED -- see module docstring. Written against gsplat's documented API,
+    never actually executed (no local CUDA GPU to run it on).
+    """
+    device = torch.device("cuda")
+    recon = sfm.reconstruction
+    densify_until = num_iterations if densify_until is None else densify_until
+
+    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_sfm(recon, device)
+    optimizer = _make_optimizer(means, quats, scales, opacities, colors)
+    xyz_grad_accum = torch.zeros(means.shape[0], device=device)
+    xyz_grad_count = torch.zeros(means.shape[0], device=device)
 
     cameras = []
     for image in recon.images.values():
@@ -186,6 +273,11 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
         loss = torch.abs(render[0] - cam["pixels"]).mean()
         optimizer.zero_grad()
         loss.backward()
+
+        with torch.no_grad():
+            xyz_grad_accum += means.grad.norm(dim=-1)
+            xyz_grad_count += 1
+
         optimizer.step()
 
         # The init clip alone wasn't enough -- gradient descent found it "cheap"
@@ -195,6 +287,15 @@ def train_gaussian_splatting(sfm: SfmResult, num_iterations: int = 3000) -> dict
         # throughout training, not just prevented at the starting point.
         with torch.no_grad():
             scales.clamp_(max=max_log_scale)
+
+        if densify_from <= step < densify_until and (step + 1) % densify_interval == 0:
+            means, quats, scales, opacities, colors = _densify_and_prune(
+                means, quats, scales, opacities, colors,
+                xyz_grad_accum, xyz_grad_count, max_log_scale, device,
+            )
+            optimizer = _make_optimizer(means, quats, scales, opacities, colors)
+            xyz_grad_accum = torch.zeros(means.shape[0], device=device)
+            xyz_grad_count = torch.zeros(means.shape[0], device=device)
 
     return {
         "means": means.detach().cpu().numpy(),
