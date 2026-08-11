@@ -54,10 +54,28 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
             job.selected_frame_count = result.selected_frame_count
             await session.commit()
 
+            # The GPU worker runs on different hardware entirely (RunPod), so it
+            # can't reach these frames on local disk -- upload each one and hand
+            # the worker presigned URLs instead, the same pattern as the input
+            # video upload, just per-frame.
+            frame_urls = []
+            for frame_path in result.frame_paths:
+                frame_key = f"projects/{job.project_id}/jobs/{job.id}/frames/{frame_path.name}"
+                storage.save(frame_key, frame_path.read_bytes())
+                frame_urls.append(storage.url_for(frame_key))
+
+            output_key = f"projects/{job.project_id}/jobs/{job.id}/output/scene.npz"
+            output_url = storage.url_for(output_key)
+            job.output_storage_key = output_key
+
             job.status = JobStatus.DISPATCHED
             await session.commit()
 
-            dispatch_to_gpu_worker(job_id=str(job.id), video_url=job.input_storage_key)
+            runpod_job_id = dispatch_to_gpu_worker(
+                job_id=str(job.id), frame_urls=frame_urls, output_url=output_url
+            )
+            job.runpod_job_id = runpod_job_id
+            await session.commit()
 
         except (DispatchNotConfigured, NotImplementedError) as exc:
             job.status = JobStatus.FAILED
