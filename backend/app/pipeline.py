@@ -34,7 +34,7 @@ def extract_frames(
     video_path: Path,
     output_dir: Path,
     sample_every_n_frames: int = 10,
-    blur_threshold: float = 60.0,
+    blur_threshold: float = 15.0,
 ) -> FrameExtractionResult:
     """Sample every Nth frame (video from a slow walkthrough has huge redundancy
     between adjacent frames -- SfM needs viewpoint diversity, not every frame), then
