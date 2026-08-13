@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import { createJob, createProject, listJobs, listProjects, Job, Project } from "./api/client";
 import JobRow from "./JobRow";
 import SceneViewer from "./SceneViewer";
+import GaussianSplatViewer from "./GaussianSplatViewer";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
   const [sceneChoice, setSceneChoice] = useState<
-    "demo_scene.json" | "real_scene.json" | "dust3r_scene.bin"
-  >("dust3r_scene.bin");
+    "demo_scene.json" | "real_scene.json" | "dust3r_scene.bin" | "dust3r_scene.ply"
+  >("dust3r_scene.ply");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
@@ -70,11 +71,16 @@ export default function App() {
             onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
             style={{ marginBottom: 12 }}
           >
-            <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, V2)</option>
+            <option value="dust3r_scene.ply">My room (DUSt3R + 20k iterations, real ellipsoid rendering)</option>
+            <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, point-sprite viewer)</option>
             <option value="real_scene.json">My room (COLMAP + 6k iterations, V0)</option>
             <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>
           </select>
-          <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
+          {sceneChoice.endsWith(".ply") ? (
+            <GaussianSplatViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
+          ) : (
+            <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
+          )}
         </section>
       )}
 

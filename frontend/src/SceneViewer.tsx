@@ -89,7 +89,13 @@ const VERTEX_SHADER = `
     vColor = color;
     vAlpha = pointAlpha;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = pointSize * (300.0 / -mvPosition.z);
+    // Clamped regardless of scene density: pointSize's *400 scaling was tuned
+    // for V0's sparse (thousands of points) COLMAP clouds, where each point
+    // needed a large sprite to cover the gap to its neighbors. Dense clouds
+    // like this one (hundreds of thousands of points) have far smaller gaps,
+    // so without a cap every sprite balloons to tens of pixels wide and they
+    // all overlap -- unreadable as a blob, and expensive to fill on the GPU.
+    gl_PointSize = clamp(pointSize * (300.0 / -mvPosition.z), 1.0, 6.0);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -114,6 +120,7 @@ export default function SceneViewer({ sceneUrl }: { sceneUrl: string }) {
   useEffect(() => {
     let disposed = false;
     let renderer: THREE.WebGLRenderer | undefined;
+    let cleanupScene: (() => void) | undefined;
     let animationFrame: number;
 
     const load = sceneUrl.endsWith(".bin") ? loadBinaryScene(sceneUrl) : loadJsonScene(sceneUrl);
@@ -253,9 +260,17 @@ export default function SceneViewer({ sceneUrl }: { sceneUrl: string }) {
         };
         animate();
 
-        return () => {
+        // Stashed on the outer-scope variable instead of returned here --
+        // a return from inside a .then() callback isn't React's effect
+        // cleanup, it just gets silently discarded. That was the bug: this
+        // dispose logic never ran on unmount/scene-switch, so `renderer`
+        // below was the only thing actually cleaned up, and even that only
+        // freed GPU-side resources, not the WebGL context slot itself --
+        // repeated scene switches leaked one context each until the
+        // browser's per-tab limit (~16 in Chrome) was hit and new contexts
+        // stopped being creatable at all.
+        cleanupScene = () => {
           window.removeEventListener("resize", handleResize);
-          cancelAnimationFrame(animationFrame);
           controls.dispose();
           geometry.dispose();
           material.dispose();
@@ -266,9 +281,11 @@ export default function SceneViewer({ sceneUrl }: { sceneUrl: string }) {
     return () => {
       disposed = true;
       cancelAnimationFrame(animationFrame);
+      cleanupScene?.();
       if (renderer && containerRef.current?.contains(renderer.domElement)) {
         containerRef.current.removeChild(renderer.domElement);
       }
+      renderer?.forceContextLoss(); // actually releases the WebGL context slot
       renderer?.dispose();
     };
   }, [sceneUrl]);
