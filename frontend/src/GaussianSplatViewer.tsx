@@ -15,8 +15,22 @@ async function loadCameraPoses(plyUrl: string): Promise<THREE.Matrix4[] | null> 
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
-    const data = (await res.json()) as { camera_to_world_matrices: number[][] };
-    return data.camera_to_world_matrices.map((flat) => new THREE.Matrix4().fromArray(flat));
+    const data = (await res.json()) as {
+      camera_to_world_matrices: number[][];
+      scene_scale_factor?: number;
+    };
+    const sceneScale = data.scene_scale_factor ?? 1;
+    return data.camera_to_world_matrices.map((flat) => {
+      const pose = new THREE.Matrix4().fromArray(flat);
+      // convert_bin_to_ply.py uniformly scales Gaussian positions to avoid
+      // tiny covariance values in the browser renderer. Camera translations
+      // must receive the same scale or the exported photographed viewpoint is
+      // no longer in the same coordinate system as the rendered scene.
+      pose.elements[12] *= sceneScale;
+      pose.elements[13] *= sceneScale;
+      pose.elements[14] *= sceneScale;
+      return pose;
+    });
   } catch {
     return null;
   }
@@ -151,6 +165,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
           // chaotic noise from point-blank range. Pull back from it instead
           // of standing exactly on it.
           camera.position.set(center.x, center.y, center.z + size * 0.5);
+          camera.lookAt(center);
         }
         moveSpeed = Math.max(size / 6, 0.01); // cross the room in ~6 seconds of holding W
       })

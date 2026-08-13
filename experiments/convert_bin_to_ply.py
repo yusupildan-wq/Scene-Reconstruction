@@ -18,6 +18,7 @@ import numpy as np
 from plyfile import PlyData, PlyElement
 
 SH_C0 = 0.28209479177387814  # fixed constant for the standard SH0 color encoding
+SCENE_SCALE_FACTOR = 100.0
 
 
 def load_bin(path: Path):
@@ -54,7 +55,6 @@ def main():
     # together by the same constant preserves the scene's shape exactly
     # (it's a uniform scale, not a distortion) while moving it into a unit
     # range this renderer's math was actually designed for.
-    SCENE_SCALE_FACTOR = 100.0
     means = means * SCENE_SCALE_FACTOR
     scales = scales * SCENE_SCALE_FACTOR
 
