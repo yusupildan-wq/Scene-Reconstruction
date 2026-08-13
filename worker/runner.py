@@ -78,6 +78,9 @@ class GaussianTrainingState:
     strategy_state: dict
     step: int
     learning_rate_decay_applied: bool = False
+    exposure_log_gains: torch.nn.Parameter | None = None
+    exposure_biases: torch.nn.Parameter | None = None
+    exposure_optimizer: torch.optim.Optimizer | None = None
 
 
 def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
@@ -378,6 +381,9 @@ def train_gaussian_splatting(
     return_training_state: bool = False,
     learning_rate_decay_step: int | None = 9000,
     learning_rate_decay_factor: float = 0.1,
+    optimize_camera_exposure: bool = True,
+    exposure_learning_rate: float = 1e-3,
+    exposure_regularization: float = 1e-3,
 ) -> dict | tuple[dict, GaussianTrainingState]:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
@@ -402,6 +408,9 @@ def train_gaussian_splatting(
         strategy_state = training_state.strategy_state
         start_step = training_state.step
         learning_rate_decay_applied = training_state.learning_rate_decay_applied
+        exposure_log_gains = training_state.exposure_log_gains
+        exposure_biases = training_state.exposure_biases
+        exposure_optimizer = training_state.exposure_optimizer
     else:
         start_step = step_offset
         if initial_gaussians is None:
@@ -437,6 +446,9 @@ def train_gaussian_splatting(
         scene_scale = max(float(np.linalg.norm(scene_extent)), 1e-6)
         strategy_state = strategy.initialize_state(scene_scale=scene_scale)
         learning_rate_decay_applied = False
+        exposure_log_gains = None
+        exposure_biases = None
+        exposure_optimizer = None
 
     stop_step = start_step + num_iterations
 
@@ -450,6 +462,25 @@ def train_gaussian_splatting(
     if not cameras:
         raise RuntimeError("No registered cameras with poses to train against")
 
+    if optimize_camera_exposure and exposure_optimizer is None:
+        # log-gain keeps the multiplicative correction positive. Gain=1 and
+        # bias=0 are identity, so a new run begins with exactly the old render.
+        exposure_log_gains = torch.nn.Parameter(
+            torch.zeros((len(cameras), 3), device=device)
+        )
+        exposure_biases = torch.nn.Parameter(
+            torch.zeros((len(cameras), 3), device=device)
+        )
+        exposure_optimizer = torch.optim.Adam(
+            [exposure_log_gains, exposure_biases], lr=exposure_learning_rate
+        )
+    elif optimize_camera_exposure and (
+        exposure_log_gains is None
+        or exposure_biases is None
+        or len(exposure_log_gains) != len(cameras)
+    ):
+        raise ValueError("Saved exposure state does not match the scene camera count")
+
     for step in range(start_step, stop_step):
         if (
             learning_rate_decay_step is not None
@@ -462,9 +493,12 @@ def train_gaussian_splatting(
                 f"Step {step}: reduced all learning rates by "
                 f"{learning_rate_decay_factor:g} for late-stage refinement."
             )
-        cam = cameras[step % len(cameras)]
+        camera_index = step % len(cameras)
+        cam = cameras[camera_index]
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
+        if exposure_optimizer is not None:
+            exposure_optimizer.zero_grad(set_to_none=True)
         # scales/opacities are stored unconstrained (log-scale, logit) so gradient
         # descent can move them freely -- exp()/sigmoid() here converts them to the
         # real positive-scale / 0-1-opacity values the renderer actually needs.
@@ -491,13 +525,28 @@ def train_gaussian_splatting(
         # SSIM_LAMBDA=0.2 matches the reference 3D Gaussian Splatting paper's
         # L1 + D-SSIM loss, which exists specifically to counter this.
         SSIM_LAMBDA = 0.2
-        l1_loss = torch.abs(render[0] - cam["pixels"]).mean()
-        d_ssim_loss = 1.0 - _ssim(render[0], cam["pixels"])
+        loss_render = render[0]
+        exposure_penalty = torch.zeros((), device=device)
+        if exposure_optimizer is not None:
+            log_gain = exposure_log_gains[camera_index]
+            bias = exposure_biases[camera_index]
+            loss_render = loss_render * torch.exp(log_gain) + bias
+            # Keep the learned camera transform close to identity. This lets it
+            # absorb measured exposure/white-balance shifts without becoming a
+            # substitute for correct geometry or scene appearance.
+            exposure_penalty = exposure_regularization * (
+                log_gain.square().mean() + bias.square().mean()
+            )
+        l1_loss = torch.abs(loss_render - cam["pixels"]).mean()
+        d_ssim_loss = 1.0 - _ssim(loss_render, cam["pixels"])
         loss = (1.0 - SSIM_LAMBDA) * l1_loss + SSIM_LAMBDA * d_ssim_loss
+        loss = loss + exposure_penalty
         strategy.step_pre_backward(params, optimizers, strategy_state, step, _meta)
         loss.backward()
         for optimizer in optimizers.values():
             optimizer.step()
+        if exposure_optimizer is not None:
+            exposure_optimizer.step()
         strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
     gaussians = _export_gaussian_params(params)
@@ -510,6 +559,9 @@ def train_gaussian_splatting(
         strategy_state,
         stop_step,
         learning_rate_decay_applied,
+        exposure_log_gains,
+        exposure_biases,
+        exposure_optimizer,
     )
     return gaussians, state
 
