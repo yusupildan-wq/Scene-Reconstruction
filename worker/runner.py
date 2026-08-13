@@ -33,6 +33,7 @@ import numpy as np
 import pycolmap
 import requests
 import torch
+import torch.nn.functional as F
 from gsplat import rasterization
 from PIL import Image
 from scipy.spatial import cKDTree
@@ -233,6 +234,44 @@ def _colmap_pose_to_viewmat(image: pycolmap.Image) -> np.ndarray:
     return viewmat
 
 
+def _gaussian_window(window_size: int, sigma: float, channels: int, device: torch.device) -> torch.Tensor:
+    coords = torch.arange(window_size, dtype=torch.float32, device=device) - window_size // 2
+    g1d = torch.exp(-(coords**2) / (2 * sigma**2))
+    g1d /= g1d.sum()
+    g2d = g1d.unsqueeze(1) @ g1d.unsqueeze(0)  # outer product -> 2D Gaussian blur kernel
+    return g2d.expand(channels, 1, window_size, window_size).contiguous()
+
+
+def _ssim(render: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+    """Structural similarity between two (H, W, C) images in [0, 1] -- classical
+    image-processing math (local-window mean/variance/covariance via Gaussian-
+    blurred convolutions), not a neural network. Used only as a differentiable
+    loss term: torch.nn.functional.conv2d already tracks gradients, so this
+    plugs into the same optimizer.step() as the L1 term below with no extra
+    wiring. See train_gaussian_splatting's loss line for why this is here --
+    pure pixel-difference (L1) loss famously biases toward blurry, averaged-out
+    results; SSIM rewards matching local structure/contrast instead, which is
+    why the reference 3D Gaussian Splatting paper trains with both, not L1 alone.
+    """
+    C1, C2 = 0.01**2, 0.03**2
+    x = render.permute(2, 0, 1).unsqueeze(0)  # (H,W,C) -> (1,C,H,W)
+    y = target.permute(2, 0, 1).unsqueeze(0)
+    channels = x.shape[1]
+    window = _gaussian_window(window_size, sigma=1.5, channels=channels, device=x.device)
+    pad = window_size // 2
+
+    mu_x = F.conv2d(x, window, padding=pad, groups=channels)
+    mu_y = F.conv2d(y, window, padding=pad, groups=channels)
+    mu_x_sq, mu_y_sq, mu_xy = mu_x * mu_x, mu_y * mu_y, mu_x * mu_y
+
+    sigma_x_sq = F.conv2d(x * x, window, padding=pad, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y * y, window, padding=pad, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, window, padding=pad, groups=channels) - mu_xy
+
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2))
+    return ssim_map.mean()
+
+
 def _make_optimizer(means, quats, scales, opacities, colors):
     return torch.optim.Adam(
         [
@@ -304,7 +343,16 @@ def train_gaussian_splatting(
             # view-dependent color yet -- spherical harmonics is a real quality
             # improvement to add once the basic loop is confirmed working
         )
-        loss = torch.abs(render[0] - cam["pixels"]).mean()
+        # Pure L1 (pixel-difference) loss biases the optimizer toward blurry,
+        # averaged-out results in ambiguous regions -- confirmed on our own
+        # A/B render check (real photo vs. server-side render, same pose:
+        # hazy/soft even after fixing the training-resolution bottleneck).
+        # SSIM_LAMBDA=0.2 matches the reference 3D Gaussian Splatting paper's
+        # L1 + D-SSIM loss, which exists specifically to counter this.
+        SSIM_LAMBDA = 0.2
+        l1_loss = torch.abs(render[0] - cam["pixels"]).mean()
+        d_ssim_loss = 1.0 - _ssim(render[0], cam["pixels"])
+        loss = (1.0 - SSIM_LAMBDA) * l1_loss + SSIM_LAMBDA * d_ssim_loss
         optimizer.zero_grad()
         loss.backward()
 

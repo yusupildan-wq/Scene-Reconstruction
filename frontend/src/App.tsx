@@ -50,42 +50,62 @@ export default function App() {
     }
   }
 
-  return (
-    <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui, sans-serif" }}>
-      <h1>Scene Reconstruction</h1>
-
-      <div style={{ marginBottom: 24 }}>
-        <button onClick={() => setActiveTab("demo")} disabled={activeTab === "demo"}>
-          Demo Scene
-        </button>{" "}
-        <button onClick={() => setActiveTab("projects")} disabled={activeTab === "projects"}>
-          Projects
-        </button>
-      </div>
-
-      {activeTab === "demo" && (
-        <section style={{ marginBottom: 32 }}>
-          <h2>Trained Gaussian Splat scene</h2>
+  if (activeTab === "demo") {
+    // Full-viewport, not the constrained page layout below -- the scene
+    // should fill the screen the moment it loads, not sit in a small boxed
+    // preview under a header. Controls float on top instead of pushing the
+    // canvas down.
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "#000" }}>
+        {sceneChoice.endsWith(".ply") ? (
+          <GaussianSplatViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
+        ) : (
+          <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
+        )}
+        <div
+          style={{
+            position: "absolute",
+            top: 12,
+            left: 12,
+            background: "rgba(0,0,0,0.6)",
+            color: "#fff",
+            padding: 12,
+            borderRadius: 8,
+            fontFamily: "system-ui, sans-serif",
+            maxWidth: 340,
+          }}
+        >
+          <div style={{ marginBottom: 8, display: "flex", gap: 8 }}>
+            <button onClick={() => setActiveTab("demo")} disabled>
+              Demo Scene
+            </button>
+            <button onClick={() => setActiveTab("projects")}>Projects</button>
+          </div>
           <select
             value={sceneChoice}
             onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
-            style={{ marginBottom: 12 }}
           >
             <option value="dust3r_scene.ply">My room (DUSt3R + 20k iterations, real ellipsoid rendering)</option>
             <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, point-sprite viewer)</option>
             <option value="real_scene.json">My room (COLMAP + 6k iterations, V0)</option>
             <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>
           </select>
-          {sceneChoice.endsWith(".ply") ? (
-            <GaussianSplatViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
-          ) : (
-            <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
-          )}
-        </section>
-      )}
+        </div>
+      </div>
+    );
+  }
 
-      {activeTab === "projects" && (
-        <>
+  return (
+    <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui, sans-serif" }}>
+      <h1>Scene Reconstruction</h1>
+
+      <div style={{ marginBottom: 24 }}>
+        <button onClick={() => setActiveTab("demo")}>Demo Scene</button>{" "}
+        <button onClick={() => setActiveTab("projects")} disabled>
+          Projects
+        </button>
+      </div>
+
       <section style={{ marginBottom: 32 }}>
         <h2>Projects</h2>
         <form onSubmit={handleCreateProject} style={{ marginBottom: 12 }}>
@@ -132,8 +152,6 @@ export default function App() {
             ))}
           </ul>
         </section>
-      )}
-        </>
       )}
     </div>
   );
