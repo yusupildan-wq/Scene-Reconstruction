@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from gsplat import rasterization
 from PIL import Image
 from scipy.spatial import cKDTree
+from gsplat.strategy import DefaultStrategy
 
 
 @dataclass
@@ -272,24 +273,34 @@ def _ssim(render: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> 
     return ssim_map.mean()
 
 
-def _make_optimizer(means, quats, scales, opacities, colors):
-    return torch.optim.Adam(
-        [
-            {"params": [means], "lr": 1.6e-4},
-            {"params": [quats], "lr": 1e-3},
-            {"params": [scales], "lr": 5e-3},
-            {"params": [opacities], "lr": 5e-2},
-            {"params": [colors], "lr": 2.5e-3},
-        ]
-    )
+def _make_optimizers(params: torch.nn.ParameterDict) -> dict[str, torch.optim.Optimizer]:
+    """One optimizer per parameter, as required by gsplat's strategy API.
+
+    DefaultStrategy edits both the Gaussian tensors and their corresponding
+    Adam state during duplicate/split/prune operations. A single multi-group
+    optimizer does not satisfy that API, and recreating Adam after every
+    refinement (the old implementation) discards its accumulated momentum and
+    variance estimates.
+    """
+    learning_rates = {
+        "means": 1.6e-4,
+        "quats": 1e-3,
+        "scales": 5e-3,
+        "opacities": 5e-2,
+        "colors": 2.5e-3,
+    }
+    return {
+        name: torch.optim.Adam([params[name]], lr=learning_rates[name])
+        for name in params.keys()
+    }
 
 
 def train_gaussian_splatting(
     scene: ReconstructedScene,
     num_iterations: int = 3000,
-    densify_from: int = 200,
+    densify_from: int = 500,
     densify_until: int | None = None,
-    densify_interval: int = 300,
+    densify_interval: int = 100,
 ) -> dict:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
@@ -305,12 +316,35 @@ def train_gaussian_splatting(
     device = torch.device("cuda")
     densify_until = num_iterations if densify_until is None else densify_until
 
-    means, quats, scales, opacities, colors, max_log_scale = _init_gaussians_from_points(
+    means, quats, scales, opacities, colors, _max_log_scale = _init_gaussians_from_points(
         scene.points_xyz, scene.points_rgb, device
     )
-    optimizer = _make_optimizer(means, quats, scales, opacities, colors)
-    xyz_grad_accum = torch.zeros(means.shape[0], device=device)
-    xyz_grad_count = torch.zeros(means.shape[0], device=device)
+    params = torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(means),
+            "quats": torch.nn.Parameter(quats),
+            "scales": torch.nn.Parameter(scales),
+            "opacities": torch.nn.Parameter(opacities),
+            "colors": torch.nn.Parameter(colors),
+        }
+    )
+    optimizers = _make_optimizers(params)
+
+    # DefaultStrategy is gsplat's maintained implementation of the original
+    # 3DGS adaptive density-control algorithm. Crucially, it accumulates
+    # gradients of projected 2D Gaussian positions (where the image lacks
+    # detail), rather than our old world-space means.grad heuristic. It also
+    # preserves each Adam optimizer's state while changing tensor sizes.
+    strategy = DefaultStrategy(
+        refine_start_iter=densify_from,
+        refine_stop_iter=densify_until,
+        refine_every=densify_interval,
+        verbose=True,
+    )
+    strategy.check_sanity(params, optimizers)
+    scene_extent = np.ptp(scene.points_xyz, axis=0)
+    scene_scale = max(float(np.linalg.norm(scene_extent)), 1e-6)
+    strategy_state = strategy.initialize_state(scene_scale=scene_scale)
 
     cameras = []
     for pixels_np, viewmat_np, K_np in zip(scene.camera_images, scene.camera_viewmats, scene.camera_Ks):
@@ -324,17 +358,19 @@ def train_gaussian_splatting(
 
     for step in range(num_iterations):
         cam = cameras[step % len(cameras)]
+        for optimizer in optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
         # scales/opacities are stored unconstrained (log-scale, logit) so gradient
         # descent can move them freely -- exp()/sigmoid() here converts them to the
         # real positive-scale / 0-1-opacity values the renderer actually needs.
         # Forgetting this step renders as solid black: raw negative "opacity" and
         # near-zero/negative "scale" are both effectively invisible.
         render, _alpha, _meta = rasterization(
-            means,
-            quats,
-            torch.exp(scales),
-            torch.sigmoid(opacities),
-            colors,
+            params["means"],
+            params["quats"],
+            torch.exp(params["scales"]),
+            torch.sigmoid(params["opacities"]),
+            params["colors"],
             cam["viewmat"].unsqueeze(0),
             cam["K"].unsqueeze(0),
             cam["w"],
@@ -353,38 +389,18 @@ def train_gaussian_splatting(
         l1_loss = torch.abs(render[0] - cam["pixels"]).mean()
         d_ssim_loss = 1.0 - _ssim(render[0], cam["pixels"])
         loss = (1.0 - SSIM_LAMBDA) * l1_loss + SSIM_LAMBDA * d_ssim_loss
-        optimizer.zero_grad()
+        strategy.step_pre_backward(params, optimizers, strategy_state, step, _meta)
         loss.backward()
-
-        with torch.no_grad():
-            xyz_grad_accum += means.grad.norm(dim=-1)
-            xyz_grad_count += 1
-
-        optimizer.step()
-
-        # The init clip alone wasn't enough -- gradient descent found it "cheap"
-        # to reduce average pixel loss by growing a few Gaussians huge (covering
-        # big areas with one blob) instead of many small correctly-placed ones.
-        # Re-clamp after every step so that degenerate solution stays unavailable
-        # throughout training, not just prevented at the starting point.
-        with torch.no_grad():
-            scales.clamp_(max=max_log_scale)
-
-        if densify_from <= step < densify_until and (step + 1) % densify_interval == 0:
-            means, quats, scales, opacities, colors = _densify_and_prune(
-                means, quats, scales, opacities, colors,
-                xyz_grad_accum, xyz_grad_count, max_log_scale, device,
-            )
-            optimizer = _make_optimizer(means, quats, scales, opacities, colors)
-            xyz_grad_accum = torch.zeros(means.shape[0], device=device)
-            xyz_grad_count = torch.zeros(means.shape[0], device=device)
+        for optimizer in optimizers.values():
+            optimizer.step()
+        strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
     return {
-        "means": means.detach().cpu().numpy(),
-        "quats": quats.detach().cpu().numpy(),
-        "scales": torch.exp(scales).detach().cpu().numpy(),
-        "opacities": torch.sigmoid(opacities).detach().cpu().numpy(),
-        "colors": colors.detach().cpu().numpy(),
+        "means": params["means"].detach().cpu().numpy(),
+        "quats": params["quats"].detach().cpu().numpy(),
+        "scales": torch.exp(params["scales"]).detach().cpu().numpy(),
+        "opacities": torch.sigmoid(params["opacities"]).detach().cpu().numpy(),
+        "colors": params["colors"].detach().cpu().numpy(),
     }
 
 
