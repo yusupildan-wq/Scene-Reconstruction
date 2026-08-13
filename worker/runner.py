@@ -84,6 +84,8 @@ class GaussianTrainingState:
     exposure_biases: torch.nn.Parameter | None = None
     exposure_optimizer: torch.optim.Optimizer | None = None
     sh_degree: int | None = None
+    camera_pose_deltas: torch.nn.Parameter | None = None
+    camera_pose_optimizer: torch.optim.Optimizer | None = None
 
 
 def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
@@ -333,6 +335,49 @@ def _apply_late_learning_rate_decay(
             param_group["lr"] *= factor
 
 
+def _skew_symmetric(vectors: torch.Tensor) -> torch.Tensor:
+    """Convert (..., 3) vectors into cross-product matrices."""
+    x, y, z = vectors.unbind(dim=-1)
+    zeros = torch.zeros_like(x)
+    return torch.stack(
+        [zeros, -z, y, z, zeros, -x, -y, x, zeros], dim=-1
+    ).reshape(vectors.shape[:-1] + (3, 3))
+
+
+def _pose_deltas_to_matrices(deltas: torch.Tensor) -> torch.Tensor:
+    """Differentiable SE(3) corrections from rotation-vector + translation.
+
+    Rodrigues' formula maps each three-value axis-angle rotation into a valid
+    orthonormal matrix. Taylor-safe coefficients keep gradients finite at the
+    identity pose where every refinement begins.
+    """
+    rotation_vectors = deltas[..., :3]
+    translations = deltas[..., 3:]
+    theta_sq = (rotation_vectors * rotation_vectors).sum(dim=-1, keepdim=True)
+    theta = torch.sqrt(theta_sq.clamp_min(1e-12))
+    A = torch.where(
+        theta_sq < 1e-8,
+        1.0 - theta_sq / 6.0 + theta_sq * theta_sq / 120.0,
+        torch.sin(theta) / theta,
+    )
+    B = torch.where(
+        theta_sq < 1e-8,
+        0.5 - theta_sq / 24.0 + theta_sq * theta_sq / 720.0,
+        (1.0 - torch.cos(theta)) / theta_sq.clamp_min(1e-12),
+    )
+    K = _skew_symmetric(rotation_vectors)
+    identity3 = torch.eye(3, dtype=deltas.dtype, device=deltas.device).expand(
+        deltas.shape[:-1] + (3, 3)
+    )
+    rotations = identity3 + A[..., None] * K + B[..., None] * (K @ K)
+    matrices = torch.eye(4, dtype=deltas.dtype, device=deltas.device).repeat(
+        *deltas.shape[:-1], 1, 1
+    )
+    matrices[..., :3, :3] = rotations
+    matrices[..., :3, 3] = translations
+    return matrices
+
+
 def _params_from_exported_gaussians(
     gaussians: dict, device: torch.device, sh_degree: int | None = None
 ) -> torch.nn.ParameterDict:
@@ -408,6 +453,10 @@ def train_gaussian_splatting(
     exposure_learning_rate: float = 1e-3,
     exposure_regularization: float = 1e-3,
     sh_degree: int | None = None,
+    optimize_camera_poses: bool = False,
+    camera_pose_learning_rate: float = 1e-5,
+    camera_rotation_regularization: float = 1e-3,
+    camera_translation_regularization: float = 1e-3,
 ) -> dict | tuple[dict, GaussianTrainingState]:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
@@ -440,6 +489,8 @@ def train_gaussian_splatting(
                 f"Requested sh_degree={sh_degree}, but saved state uses "
                 f"sh_degree={training_state.sh_degree}"
             )
+        camera_pose_deltas = training_state.camera_pose_deltas
+        camera_pose_optimizer = training_state.camera_pose_optimizer
     else:
         start_step = step_offset
         if initial_gaussians is None:
@@ -478,8 +529,11 @@ def train_gaussian_splatting(
         exposure_log_gains = None
         exposure_biases = None
         exposure_optimizer = None
+        camera_pose_deltas = None
+        camera_pose_optimizer = None
 
     stop_step = start_step + num_iterations
+    scene_scale = float(strategy_state["scene_scale"])
 
     cameras = []
     for pixels_np, viewmat_np, K_np in zip(scene.camera_images, scene.camera_viewmats, scene.camera_Ks):
@@ -510,6 +564,18 @@ def train_gaussian_splatting(
     ):
         raise ValueError("Saved exposure state does not match the scene camera count")
 
+    if optimize_camera_poses and camera_pose_optimizer is None:
+        camera_pose_deltas = torch.nn.Parameter(
+            torch.zeros((len(cameras), 6), device=device)
+        )
+        camera_pose_optimizer = torch.optim.Adam(
+            [camera_pose_deltas], lr=camera_pose_learning_rate
+        )
+    elif optimize_camera_poses and (
+        camera_pose_deltas is None or len(camera_pose_deltas) != len(cameras)
+    ):
+        raise ValueError("Saved camera-pose state does not match the scene camera count")
+
     for step in range(start_step, stop_step):
         if (
             learning_rate_decay_step is not None
@@ -528,6 +594,23 @@ def train_gaussian_splatting(
             optimizer.zero_grad(set_to_none=True)
         if exposure_optimizer is not None:
             exposure_optimizer.zero_grad(set_to_none=True)
+        if camera_pose_optimizer is not None:
+            camera_pose_optimizer.zero_grad(set_to_none=True)
+        viewmat = cam["viewmat"]
+        pose_penalty = torch.zeros((), device=device)
+        if camera_pose_optimizer is not None:
+            # Fix camera 0 as the world-frame gauge. Multiplying its delta by
+            # zero also prevents it from receiving an optimizer update.
+            anchor_mask = 0.0 if camera_index == 0 else 1.0
+            pose_delta = camera_pose_deltas[camera_index] * anchor_mask
+            correction = _pose_deltas_to_matrices(pose_delta.unsqueeze(0))[0]
+            viewmat = correction @ viewmat
+            rotation_delta = pose_delta[:3]
+            translation_delta = pose_delta[3:] / scene_scale
+            pose_penalty = (
+                camera_rotation_regularization * rotation_delta.square().mean()
+                + camera_translation_regularization * translation_delta.square().mean()
+            )
         # scales/opacities are stored unconstrained (log-scale, logit) so gradient
         # descent can move them freely -- exp()/sigmoid() here converts them to the
         # real positive-scale / 0-1-opacity values the renderer actually needs.
@@ -539,7 +622,7 @@ def train_gaussian_splatting(
             torch.exp(params["scales"]),
             torch.sigmoid(params["opacities"]),
             params["colors"],
-            cam["viewmat"].unsqueeze(0),
+            viewmat.unsqueeze(0),
             cam["K"].unsqueeze(0),
             cam["w"],
             cam["h"],
@@ -567,13 +650,15 @@ def train_gaussian_splatting(
         l1_loss = torch.abs(loss_render - cam["pixels"]).mean()
         d_ssim_loss = 1.0 - _ssim(loss_render, cam["pixels"])
         loss = (1.0 - SSIM_LAMBDA) * l1_loss + SSIM_LAMBDA * d_ssim_loss
-        loss = loss + exposure_penalty
+        loss = loss + exposure_penalty + pose_penalty
         strategy.step_pre_backward(params, optimizers, strategy_state, step, _meta)
         loss.backward()
         for optimizer in optimizers.values():
             optimizer.step()
         if exposure_optimizer is not None:
             exposure_optimizer.step()
+        if camera_pose_optimizer is not None:
+            camera_pose_optimizer.step()
         strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
     gaussians = _export_gaussian_params(params, sh_degree)
@@ -590,6 +675,8 @@ def train_gaussian_splatting(
         exposure_biases,
         exposure_optimizer,
         sh_degree,
+        camera_pose_deltas,
+        camera_pose_optimizer,
     )
     return gaussians, state
 
