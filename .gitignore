@@ -13,3 +13,5 @@ frontend/dist/
 # Large local experiment artifacts (documented by adjacent README files).
 experiments/artifacts/**/*.npz
 experiments/artifacts/**/*_executed.ipynb
+experiments/artifacts/**/frames/
+experiments/artifacts/**/contact_sheet.jpg

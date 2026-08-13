@@ -1,4 +1,4 @@
-"""Convert our custom dust3r_scene.bin into a standard 3D Gaussian Splatting .ply.
+"""Convert a saved Gaussian scene (.bin or training .npz) into a standard .ply.
 
 One-off local utility, not part of the pipeline -- dust3r_scene.bin already has
 everything needed (the Colab export cell writes quats; our browser viewer's
@@ -11,14 +11,15 @@ runner.py returns (already activated) -- so this inverts those activations
 back before writing.
 """
 
+import argparse
 import struct
 from pathlib import Path
 
 import numpy as np
-from plyfile import PlyData, PlyElement
 
 SH_C0 = 0.28209479177387814  # fixed constant for the standard SH0 color encoding
 SCENE_SCALE_FACTOR = 100.0
+MAX_AXIS_RATIO = 20.0
 
 
 def load_bin(path: Path):
@@ -37,13 +38,29 @@ def load_bin(path: Path):
     return n, means, quats, scales, opacities, colors
 
 
-def main():
-    root = Path(__file__).resolve().parent.parent
-    bin_path = root / "frontend" / "public" / "dust3r_scene.bin"
-    ply_path = root / "frontend" / "public" / "dust3r_scene.ply"
+def write_binary_ply(path: Path, vertices: np.ndarray) -> None:
+    property_names = vertices.dtype.names or ()
+    header = ["ply", "format binary_little_endian 1.0", f"element vertex {len(vertices)}"]
+    header.extend(f"property float {name}" for name in property_names)
+    header.extend(["end_header", ""])
+    with path.open("wb") as stream:
+        stream.write("\n".join(header).encode("ascii"))
+        stream.write(vertices.tobytes())
 
-    n, means, quats, scales, opacities, colors = load_bin(bin_path)
-    print(f"Loaded {n} Gaussians from {bin_path}")
+
+def convert_npz(npz_path: Path, ply_path: Path) -> None:
+    with np.load(npz_path) as scene:
+        means = scene["means"].astype(np.float32)
+        quats = scene["quats"].astype(np.float32)
+        scales = scene["scales"].astype(np.float32)
+        opacities = scene["opacities"].astype(np.float32)
+        colors = scene["colors"].astype(np.float32)
+    _write_scene(ply_path, means, quats, scales, opacities, colors)
+
+
+def _write_scene(ply_path, means, quats, scales, opacities, colors):
+    ply_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(means)
 
     # DUSt3R's coordinate frame is arbitrary/canonical, not real-world meters
     # -- this scene's whole bounding box is ~0.89 units, so individual
@@ -57,6 +74,12 @@ def main():
     # range this renderer's math was actually designed for.
     means = means * SCENE_SCALE_FACTOR
     scales = scales * SCENE_SCALE_FACTOR
+
+    # Extreme anisotropy produces the screen-spanning needle artifacts seen
+    # from novel viewpoints. Keep surface-like ellipsoids, but cap pathological
+    # long axes relative to each Gaussian's smallest axis.
+    minimum_axis = np.maximum(scales.min(axis=1, keepdims=True), 1e-8)
+    scales = np.minimum(scales, minimum_axis * MAX_AXIS_RATIO)
 
     log_scales = np.log(np.clip(scales, 1e-8, None))
     logit_opacities = np.log(np.clip(opacities, 1e-6, 1 - 1e-6) / (1 - np.clip(opacities, 1e-6, 1 - 1e-6)))
@@ -87,9 +110,27 @@ def main():
         quats[:, 1], quats[:, 2], quats[:, 3], quats[:, 0]
     )
 
-    PlyData([PlyElement.describe(vertices, "vertex")], text=False).write(ply_path)
+    write_binary_ply(ply_path, vertices)
     size_mb = ply_path.stat().st_size / 1e6
     print(f"Wrote {ply_path} ({size_mb:.1f} MB)")
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--npz", type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    if args.npz:
+        ply_path = args.output or args.npz.with_suffix(".ply")
+        convert_npz(args.npz, ply_path)
+        return
+
+    bin_path = root / "frontend" / "public" / "dust3r_scene.bin"
+    ply_path = args.output or root / "frontend" / "public" / "dust3r_scene.ply"
+    n, means, quats, scales, opacities, colors = load_bin(bin_path)
+    print(f"Loaded {n} Gaussians from {bin_path}")
+    _write_scene(ply_path, means, quats, scales, opacities, colors)
 
 
 if __name__ == "__main__":

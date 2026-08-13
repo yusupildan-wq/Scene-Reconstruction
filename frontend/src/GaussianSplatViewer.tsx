@@ -50,9 +50,21 @@ async function loadCameraPoses(plyUrl: string): Promise<THREE.Matrix4[] | null> 
 // eye-level placement on a known floor.
 export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const cameraPosesRef = useRef<THREE.Matrix4[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
+  const [activeView, setActiveView] = useState(15);
+
+  const jumpToTrainingView = (viewIndex: number) => {
+    const camera = cameraRef.current;
+    const pose = cameraPosesRef.current[viewIndex];
+    if (!camera || !pose) return;
+    pose.decompose(camera.position, camera.quaternion, new THREE.Vector3());
+    camera.updateMatrixWorld(true);
+    setActiveView(viewIndex);
+  };
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -66,12 +78,16 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
     scene.background = new THREE.Color(0x111111);
 
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.01, 1000);
+    cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(container.clientWidth, container.clientHeight);
     container.appendChild(renderer.domElement);
 
     const controls = new PointerLockControls(camera, renderer.domElement);
+    // This scene's imported camera basis makes PointerLockControls feel
+    // horizontally reversed; invert look input while retaining corrected WASD.
+    controls.pointerSpeed = -1;
     const handleLock = () => setIsLocked(true);
     const handleUnlock = () => setIsLocked(false);
     controls.addEventListener("lock", handleLock);
@@ -149,15 +165,18 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         const size = box.getSize(new THREE.Vector3()).length();
 
         if (cameraPoses && cameraPoses.length > 0) {
+          cameraPosesRef.current = cameraPoses;
           // Real photo vantage point: guaranteed to be open, photographed
           // space, not guessed geometry.
-          const pose = cameraPoses[Math.floor(cameraPoses.length / 2)];
+          const initialView = Math.min(15, cameraPoses.length - 1);
+          const pose = cameraPoses[initialView];
           const position = new THREE.Vector3();
           const quaternion = new THREE.Quaternion();
           const scale = new THREE.Vector3();
           pose.decompose(position, quaternion, scale);
           camera.position.copy(position);
           camera.quaternion.copy(quaternion);
+          setActiveView(initialView);
         } else {
           // No pose data for this scene (older export) -- the raw centroid
           // of every Gaussian's position can land inside a wall or dense
@@ -194,8 +213,11 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
 
       if (controls.isLocked) {
         const step = moveSpeed * delta;
-        if (keys.forward) controls.moveForward(step);
-        if (keys.backward) controls.moveForward(-step);
+        // The imported training-camera convention faces opposite Three.js's
+        // default local forward axis, so compensate here to preserve normal
+        // first-person controls: W advances and S retreats.
+        if (keys.forward) controls.moveForward(-step);
+        if (keys.backward) controls.moveForward(step);
         if (keys.right) controls.moveRight(step);
         if (keys.left) controls.moveRight(-step);
       }
@@ -228,6 +250,8 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
       }
       renderer.forceContextLoss();
       renderer.dispose();
+      cameraRef.current = null;
+      cameraPosesRef.current = [];
     };
   }, [sceneUrl]);
 
@@ -237,6 +261,42 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         ref={containerRef}
         style={{ width: "100%", height: "100%", background: "#111", cursor: isLocked ? "none" : "pointer" }}
       />
+      {loaded && (
+        <div
+          onClick={(event) => event.stopPropagation()}
+          style={{
+            position: "absolute",
+            top: 16,
+            left: 16,
+            display: "flex",
+            gap: 6,
+            padding: 8,
+            borderRadius: 8,
+            background: "rgba(0,0,0,0.72)",
+            color: "white",
+            fontFamily: "system-ui, sans-serif",
+          }}
+        >
+          <span style={{ alignSelf: "center", marginRight: 4 }}>Training camera:</span>
+          {[0, 7, 15, 23, 31].map((viewIndex) => (
+            <button
+              key={viewIndex}
+              type="button"
+              onClick={() => jumpToTrainingView(viewIndex)}
+              style={{
+                padding: "5px 9px",
+                border: activeView === viewIndex ? "1px solid #fff" : "1px solid #777",
+                borderRadius: 5,
+                background: activeView === viewIndex ? "#2563eb" : "#222",
+                color: "white",
+                cursor: "pointer",
+              }}
+            >
+              {viewIndex}
+            </button>
+          ))}
+        </div>
+      )}
       {loaded && !isLocked && (
         <div
           style={{

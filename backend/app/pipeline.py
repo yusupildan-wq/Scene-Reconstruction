@@ -35,6 +35,7 @@ def extract_frames(
     output_dir: Path,
     sample_every_n_frames: int = 10,
     blur_threshold: float = 15.0,
+    max_selected_frames: int | None = 96,
 ) -> FrameExtractionResult:
     """Sample every Nth frame (video from a slow walkthrough has huge redundancy
     between adjacent frames -- SfM needs viewpoint diversity, not every frame), then
@@ -60,6 +61,19 @@ def extract_frames(
             frame_index += 1
     finally:
         capture.release()
+
+    # DUSt3R cost grows with the number of images/pairs. For long captures,
+    # retain a uniformly distributed subset rather than simply taking the
+    # earliest sharp frames; this preserves every part of a full-room loop.
+    if max_selected_frames and len(selected_paths) > max_selected_frames:
+        keep_indices = np.linspace(
+            0, len(selected_paths) - 1, max_selected_frames, dtype=int
+        )
+        keep = {selected_paths[index] for index in keep_indices}
+        for path in selected_paths:
+            if path not in keep:
+                path.unlink()
+        selected_paths = [path for path in selected_paths if path in keep]
 
     return FrameExtractionResult(
         frame_paths=selected_paths,

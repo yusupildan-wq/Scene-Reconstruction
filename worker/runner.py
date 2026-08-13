@@ -654,8 +654,13 @@ def train_gaussian_splatting(
             )
         l1_loss = torch.abs(loss_render - cam["pixels"]).mean()
         d_ssim_loss = 1.0 - _ssim(loss_render, cam["pixels"])
+        # Needle-like ellipsoids cheaply cover uncertain pixels in observed
+        # views but become catastrophic streaks as soon as the user moves.
+        # Penalize only log-axis spreads beyond a generous 20:1 ratio.
+        log_scale_span = params["scales"].amax(dim=1) - params["scales"].amin(dim=1)
+        anisotropy_penalty = torch.relu(log_scale_span - np.log(20.0)).square().mean()
         loss = (1.0 - SSIM_LAMBDA) * l1_loss + SSIM_LAMBDA * d_ssim_loss
-        loss = loss + exposure_penalty + pose_penalty
+        loss = loss + 1e-4 * anisotropy_penalty + exposure_penalty + pose_penalty
         strategy.step_pre_backward(params, optimizers, strategy_state, step, _meta)
         loss.backward()
         for optimizer in optimizers.values():
