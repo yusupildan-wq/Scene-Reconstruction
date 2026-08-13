@@ -24,6 +24,7 @@ The large binary checkpoint and executed notebook are intentionally ignored by
 Git. Their expected local filenames in this folder are:
 
 - `best_scene_370k.npz`
+- `best_scene_camera_state.npz`
 - `colab_dust3r_pipeline_executed.ipynb`
 
 The originals remain in the user's Downloads folder.
@@ -34,3 +35,12 @@ SHA-256 checksums:
   `B51B19D698727034EA9700CF872015CE43D198B27DEC3B40655E0FFF16C1FEDA`
 - `colab_dust3r_pipeline_executed.ipynb`:
   `4B17C6660A8497953D1AC19BAD804C2250131892694C01C315A49CE8D0DFFD30`
+- `best_scene_camera_state.npz`:
+  `BA425AEF59D649F13A7B2841FD4989ED5FBB5F34AA0C51320D6C40C9FEEFB9A2`
+
+Camera-state contents:
+
+- `camera_pose_deltas`: `(32, 6)` float32; rotation-vector XYZ followed by
+  translation XYZ, applied as a left-multiplied world-to-camera correction
+- `exposure_log_gains`: `(32, 3)` float32
+- `exposure_biases`: `(32, 3)` float32
