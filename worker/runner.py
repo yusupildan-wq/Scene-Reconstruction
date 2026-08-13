@@ -454,6 +454,7 @@ def train_gaussian_splatting(
     exposure_regularization: float = 1e-3,
     sh_degree: int | None = None,
     optimize_camera_poses: bool = False,
+    camera_pose_refinement_start_step: int = 15000,
     camera_pose_learning_rate: float = 1e-5,
     camera_rotation_regularization: float = 1e-3,
     camera_translation_regularization: float = 1e-3,
@@ -594,11 +595,15 @@ def train_gaussian_splatting(
             optimizer.zero_grad(set_to_none=True)
         if exposure_optimizer is not None:
             exposure_optimizer.zero_grad(set_to_none=True)
-        if camera_pose_optimizer is not None:
+        pose_refinement_active = (
+            camera_pose_optimizer is not None
+            and step >= camera_pose_refinement_start_step
+        )
+        if pose_refinement_active:
             camera_pose_optimizer.zero_grad(set_to_none=True)
         viewmat = cam["viewmat"]
         pose_penalty = torch.zeros((), device=device)
-        if camera_pose_optimizer is not None:
+        if pose_refinement_active:
             # Fix camera 0 as the world-frame gauge. Multiplying its delta by
             # zero also prevents it from receiving an optimizer update.
             anchor_mask = 0.0 if camera_index == 0 else 1.0
@@ -657,7 +662,7 @@ def train_gaussian_splatting(
             optimizer.step()
         if exposure_optimizer is not None:
             exposure_optimizer.step()
-        if camera_pose_optimizer is not None:
+        if pose_refinement_active:
             camera_pose_optimizer.step()
         strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
