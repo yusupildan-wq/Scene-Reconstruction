@@ -63,6 +63,22 @@ class ReconstructedScene:
     camera_images: list[np.ndarray]  # each (H, W, 3) float32, in [0, 1]
 
 
+@dataclass
+class GaussianTrainingState:
+    """Live, resumable optimization state for chunked in-session training.
+
+    This intentionally stays on the GPU. It preserves Adam momentum/variance,
+    DefaultStrategy's accumulated screen-space statistics, and the absolute
+    training step so a later call can continue rather than restart.
+    """
+
+    params: torch.nn.ParameterDict
+    optimizers: dict[str, torch.optim.Optimizer]
+    strategy: DefaultStrategy
+    strategy_state: dict
+    step: int
+
+
 def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
     """Adapter: pycolmap's specific object types -> the generic scene format
     train_gaussian_splatting actually consumes."""
@@ -295,13 +311,56 @@ def _make_optimizers(params: torch.nn.ParameterDict) -> dict[str, torch.optim.Op
     }
 
 
+def _params_from_exported_gaussians(
+    gaussians: dict, device: torch.device
+) -> torch.nn.ParameterDict:
+    """Restore trainable raw parameters from the activated export representation.
+
+    Exports contain positive scales and 0..1 opacities. Training stores their
+    unconstrained log/logit forms, so warm-starting requires the inverse
+    transforms below. This reuses the optimized scene, but cannot reconstruct
+    Adam or density-strategy history that was not returned by an older run.
+    """
+    scales = np.log(np.clip(gaussians["scales"], 1e-8, None))
+    opacities = np.clip(gaussians["opacities"], 1e-6, 1 - 1e-6)
+    opacity_logits = np.log(opacities / (1 - opacities))
+    return torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(torch.tensor(gaussians["means"], device=device)),
+            "quats": torch.nn.Parameter(torch.tensor(gaussians["quats"], device=device)),
+            "scales": torch.nn.Parameter(
+                torch.tensor(scales, dtype=torch.float32, device=device)
+            ),
+            "opacities": torch.nn.Parameter(
+                torch.tensor(opacity_logits, dtype=torch.float32, device=device)
+            ),
+            "colors": torch.nn.Parameter(torch.tensor(gaussians["colors"], device=device)),
+        }
+    )
+
+
+def _export_gaussian_params(params: torch.nn.ParameterDict) -> dict:
+    return {
+        "means": params["means"].detach().cpu().numpy(),
+        "quats": params["quats"].detach().cpu().numpy(),
+        "scales": torch.exp(params["scales"]).detach().cpu().numpy(),
+        "opacities": torch.sigmoid(params["opacities"]).detach().cpu().numpy(),
+        "colors": params["colors"].detach().cpu().numpy(),
+    }
+
+
 def train_gaussian_splatting(
     scene: ReconstructedScene,
     num_iterations: int = 3000,
     densify_from: int = 500,
     densify_until: int | None = None,
     densify_interval: int = 100,
-) -> dict:
+    *,
+    initial_gaussians: dict | None = None,
+    step_offset: int = 0,
+    training_state: GaussianTrainingState | None = None,
+    return_training_state: bool = False,
+) -> dict | tuple[dict, GaussianTrainingState]:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
     with adaptive density control (split/clone/prune) growing detail beyond
@@ -310,41 +369,56 @@ def train_gaussian_splatting(
     Backend-agnostic: only depends on ReconstructedScene's plain arrays, not on
     COLMAP specifically -- DUSt3R (or anything else) can feed this the same way.
 
-    UNVERIFIED -- see module docstring. Written against gsplat's documented API,
-    never actually executed (no local CUDA GPU to run it on).
+    The core gsplat 1.5.3 screen-space strategy path has passed a real Colab T4
+    smoke run. The resumable-state and exported-scene warm-start paths remain
+    UNVALIDATED UNTIL A REAL COLAB GPU RUN.
     """
     device = torch.device("cuda")
-    densify_until = num_iterations if densify_until is None else densify_until
+    if training_state is not None and initial_gaussians is not None:
+        raise ValueError("Pass training_state or initial_gaussians, not both")
 
-    means, quats, scales, opacities, colors, _max_log_scale = _init_gaussians_from_points(
-        scene.points_xyz, scene.points_rgb, device
-    )
-    params = torch.nn.ParameterDict(
-        {
-            "means": torch.nn.Parameter(means),
-            "quats": torch.nn.Parameter(quats),
-            "scales": torch.nn.Parameter(scales),
-            "opacities": torch.nn.Parameter(opacities),
-            "colors": torch.nn.Parameter(colors),
-        }
-    )
-    optimizers = _make_optimizers(params)
+    if training_state is not None:
+        params = training_state.params
+        optimizers = training_state.optimizers
+        strategy = training_state.strategy
+        strategy_state = training_state.strategy_state
+        start_step = training_state.step
+    else:
+        start_step = step_offset
+        if initial_gaussians is None:
+            means, quats, scales, opacities, colors, _max_log_scale = _init_gaussians_from_points(
+                scene.points_xyz, scene.points_rgb, device
+            )
+            params = torch.nn.ParameterDict(
+                {
+                    "means": torch.nn.Parameter(means),
+                    "quats": torch.nn.Parameter(quats),
+                    "scales": torch.nn.Parameter(scales),
+                    "opacities": torch.nn.Parameter(opacities),
+                    "colors": torch.nn.Parameter(colors),
+                }
+            )
+        else:
+            params = _params_from_exported_gaussians(initial_gaussians, device)
 
-    # DefaultStrategy is gsplat's maintained implementation of the original
-    # 3DGS adaptive density-control algorithm. Crucially, it accumulates
-    # gradients of projected 2D Gaussian positions (where the image lacks
-    # detail), rather than our old world-space means.grad heuristic. It also
-    # preserves each Adam optimizer's state while changing tensor sizes.
-    strategy = DefaultStrategy(
-        refine_start_iter=densify_from,
-        refine_stop_iter=densify_until,
-        refine_every=densify_interval,
-        verbose=True,
-    )
-    strategy.check_sanity(params, optimizers)
-    scene_extent = np.ptp(scene.points_xyz, axis=0)
-    scene_scale = max(float(np.linalg.norm(scene_extent)), 1e-6)
-    strategy_state = strategy.initialize_state(scene_scale=scene_scale)
+        optimizers = _make_optimizers(params)
+        stop_step = start_step + num_iterations
+        densify_until = stop_step if densify_until is None else densify_until
+        # A warm start has no saved screen-gradient history. Give it 500 steps
+        # to accumulate representative statistics before its first refinement.
+        effective_densify_from = max(densify_from, start_step + 500)
+        strategy = DefaultStrategy(
+            refine_start_iter=effective_densify_from,
+            refine_stop_iter=densify_until,
+            refine_every=densify_interval,
+            verbose=True,
+        )
+        strategy.check_sanity(params, optimizers)
+        scene_extent = np.ptp(scene.points_xyz, axis=0)
+        scene_scale = max(float(np.linalg.norm(scene_extent)), 1e-6)
+        strategy_state = strategy.initialize_state(scene_scale=scene_scale)
+
+    stop_step = start_step + num_iterations
 
     cameras = []
     for pixels_np, viewmat_np, K_np in zip(scene.camera_images, scene.camera_viewmats, scene.camera_Ks):
@@ -356,7 +430,7 @@ def train_gaussian_splatting(
     if not cameras:
         raise RuntimeError("No registered cameras with poses to train against")
 
-    for step in range(num_iterations):
+    for step in range(start_step, stop_step):
         cam = cameras[step % len(cameras)]
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
@@ -395,13 +469,11 @@ def train_gaussian_splatting(
             optimizer.step()
         strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
-    return {
-        "means": params["means"].detach().cpu().numpy(),
-        "quats": params["quats"].detach().cpu().numpy(),
-        "scales": torch.exp(params["scales"]).detach().cpu().numpy(),
-        "opacities": torch.sigmoid(params["opacities"]).detach().cpu().numpy(),
-        "colors": params["colors"].detach().cpu().numpy(),
-    }
+    gaussians = _export_gaussian_params(params)
+    if not return_training_state:
+        return gaussians
+    state = GaussianTrainingState(params, optimizers, strategy, strategy_state, stop_step)
+    return gaussians, state
 
 
 def evaluate_and_upload(job: JobPayload, gaussians: dict) -> dict:
