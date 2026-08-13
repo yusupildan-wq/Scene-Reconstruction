@@ -10,3 +10,6 @@ frontend/dist/
 *.tsbuildinfo
 
 .DS_Store
+# Large local experiment artifacts (documented by adjacent README files).
+experiments/artifacts/**/*.npz
+experiments/artifacts/**/*_executed.ipynb
