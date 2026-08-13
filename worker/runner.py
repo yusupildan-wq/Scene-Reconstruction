@@ -39,6 +39,8 @@ from PIL import Image
 from scipy.spatial import cKDTree
 from gsplat.strategy import DefaultStrategy
 
+SH_C0 = 0.28209479177387814
+
 
 @dataclass
 class JobPayload:
@@ -81,6 +83,7 @@ class GaussianTrainingState:
     exposure_log_gains: torch.nn.Parameter | None = None
     exposure_biases: torch.nn.Parameter | None = None
     exposure_optimizer: torch.optim.Optimizer | None = None
+    sh_degree: int | None = None
 
 
 def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
@@ -331,7 +334,7 @@ def _apply_late_learning_rate_decay(
 
 
 def _params_from_exported_gaussians(
-    gaussians: dict, device: torch.device
+    gaussians: dict, device: torch.device, sh_degree: int | None = None
 ) -> torch.nn.ParameterDict:
     """Restore trainable raw parameters from the activated export representation.
 
@@ -343,6 +346,17 @@ def _params_from_exported_gaussians(
     scales = np.log(np.clip(gaussians["scales"], 1e-8, None))
     opacities = np.clip(gaussians["opacities"], 1e-6, 1 - 1e-6)
     opacity_logits = np.log(opacities / (1 - opacities))
+    colors = torch.tensor(gaussians["colors"], device=device)
+    if sh_degree is not None:
+        coefficient_count = (sh_degree + 1) ** 2
+        sh_coefficients = torch.zeros(
+            (len(colors), coefficient_count, 3), dtype=colors.dtype, device=device
+        )
+        # gsplat evaluates SH color as 0.5 + C0 * dc + directional terms.
+        # This inverse makes the new SH scene render exactly like the existing
+        # fixed-RGB scene before any directional coefficient is optimized.
+        sh_coefficients[:, 0, :] = (colors - 0.5) / SH_C0
+        colors = sh_coefficients
     return torch.nn.ParameterDict(
         {
             "means": torch.nn.Parameter(torch.tensor(gaussians["means"], device=device)),
@@ -353,19 +367,28 @@ def _params_from_exported_gaussians(
             "opacities": torch.nn.Parameter(
                 torch.tensor(opacity_logits, dtype=torch.float32, device=device)
             ),
-            "colors": torch.nn.Parameter(torch.tensor(gaussians["colors"], device=device)),
+            "colors": torch.nn.Parameter(colors),
         }
     )
 
 
-def _export_gaussian_params(params: torch.nn.ParameterDict) -> dict:
-    return {
+def _export_gaussian_params(
+    params: torch.nn.ParameterDict, sh_degree: int | None = None
+) -> dict:
+    result = {
         "means": params["means"].detach().cpu().numpy(),
         "quats": params["quats"].detach().cpu().numpy(),
         "scales": torch.exp(params["scales"]).detach().cpu().numpy(),
         "opacities": torch.sigmoid(params["opacities"]).detach().cpu().numpy(),
-        "colors": params["colors"].detach().cpu().numpy(),
     }
+    if sh_degree is None:
+        result["colors"] = params["colors"].detach().cpu().numpy()
+    else:
+        coefficients = params["colors"].detach()
+        result["colors"] = (0.5 + SH_C0 * coefficients[:, 0, :]).cpu().numpy()
+        result["sh_coeffs"] = coefficients.cpu().numpy()
+        result["sh_degree"] = sh_degree
+    return result
 
 
 def train_gaussian_splatting(
@@ -384,6 +407,7 @@ def train_gaussian_splatting(
     optimize_camera_exposure: bool = True,
     exposure_learning_rate: float = 1e-3,
     exposure_regularization: float = 1e-3,
+    sh_degree: int | None = None,
 ) -> dict | tuple[dict, GaussianTrainingState]:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
@@ -411,6 +435,11 @@ def train_gaussian_splatting(
         exposure_log_gains = training_state.exposure_log_gains
         exposure_biases = training_state.exposure_biases
         exposure_optimizer = training_state.exposure_optimizer
+        if sh_degree != training_state.sh_degree:
+            raise ValueError(
+                f"Requested sh_degree={sh_degree}, but saved state uses "
+                f"sh_degree={training_state.sh_degree}"
+            )
     else:
         start_step = step_offset
         if initial_gaussians is None:
@@ -427,7 +456,7 @@ def train_gaussian_splatting(
                 }
             )
         else:
-            params = _params_from_exported_gaussians(initial_gaussians, device)
+            params = _params_from_exported_gaussians(initial_gaussians, device, sh_degree)
 
         optimizers = _make_optimizers(params)
         stop_step = start_step + num_iterations
@@ -514,9 +543,7 @@ def train_gaussian_splatting(
             cam["K"].unsqueeze(0),
             cam["w"],
             cam["h"],
-            sh_degree=None,  # plain RGB per Gaussian for the first version, no
-            # view-dependent color yet -- spherical harmonics is a real quality
-            # improvement to add once the basic loop is confirmed working
+            sh_degree=sh_degree,
         )
         # Pure L1 (pixel-difference) loss biases the optimizer toward blurry,
         # averaged-out results in ambiguous regions -- confirmed on our own
@@ -549,7 +576,7 @@ def train_gaussian_splatting(
             exposure_optimizer.step()
         strategy.step_post_backward(params, optimizers, strategy_state, step, _meta, packed=True)
 
-    gaussians = _export_gaussian_params(params)
+    gaussians = _export_gaussian_params(params, sh_degree)
     if not return_training_state:
         return gaussians
     state = GaussianTrainingState(
@@ -562,6 +589,7 @@ def train_gaussian_splatting(
         exposure_log_gains,
         exposure_biases,
         exposure_optimizer,
+        sh_degree,
     )
     return gaussians, state
 
