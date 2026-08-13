@@ -63,6 +63,13 @@ def diagnose_cross_view_consistency(
         f"min={valid_counts.min()}, median={np.median(valid_counts):.0f}, "
         f"max={valid_counts.max()}, empty_views={int((valid_counts == 0).sum())}"
     )
+    weak_threshold = max(1, int(np.median(valid_counts) * 0.1))
+    weak_indices = np.flatnonzero(valid_counts < weak_threshold)
+    if len(weak_indices):
+        print(
+            "Views below 10% of median valid geometry: "
+            + ", ".join(f"{index} ({valid_counts[index]} points)" for index in weak_indices)
+        )
 
     pair_labels: list[str] = []
     overlaps: list[float] = []
