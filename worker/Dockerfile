@@ -5,6 +5,11 @@
 # should match whatever GPU type gets chosen on RunPod.
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
+# gsplat JIT-compiles CUDA extensions. The default follows the host CPU count
+# and can launch ten memory-heavy compiler processes at once, exhausting small
+# notebook/Pod hosts before training begins.
+ENV MAX_JOBS=2
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
     libgl1 libglib2.0-0 \
