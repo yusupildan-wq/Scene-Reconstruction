@@ -1,76 +1,216 @@
-"""Find candidate loop-closure frame pairs for DUSt3R's pair graph.
+"""Build reliable non-local image pairs for room-scale reconstruction.
 
-DUSt3R's own dust3r.image_pairs.make_pairs (verified against its real source)
-only offers 'complete' (all pairs), 'swin'/'logwin' (temporal-window pairing,
-optionally wrapping the *first and last* frame of the sequence -- its own
-"explicit loop closure"), and 'oneref' (star graph to one reference frame).
-None of these detect a camera *revisiting* the same physical area in the
-middle of a capture -- e.g. walking past the desk again 40 seconds later --
-which is exactly the "weak cross-room connections and loop closure" bottleneck
-identified in CLAUDE_HANDOFF.md.
-
-This module is classical, non-learned image processing (a small grayscale
-thumbnail per frame, compared by cosine similarity) -- not a neural network,
-no pretrained weights, nothing to train. It only proposes CANDIDATE pairs:
-DUSt3R still predicts geometry for each pair independently, and the
-cross-view consistency gate in dust3r_diagnostics.py still decides whether a
-candidate pair actually agrees before it's trusted.
+Appearance similarity proposes possible revisits; ORB correspondences and
+RANSAC then verify real image geometry before an edge is admitted. This avoids
+the false loop closures caused by similar blank walls and bright windows.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
 
 
-def compute_frame_descriptors(frame_paths: Sequence[str | Path], thumb_size: int = 32) -> np.ndarray:
-    """One small, L2-normalized grayscale thumbnail per frame, flattened to a
-    vector. A coarse appearance fingerprint -- cheap enough to compare every
-    frame against every other frame even for thousands of frames, and good
-    enough to flag plausible revisits for DUSt3R to actually verify, not a
-    claim of geometric match by itself."""
-    descriptors = np.empty((len(frame_paths), thumb_size * thumb_size), dtype=np.float32)
+@dataclass(frozen=True)
+class VerifiedLoopClosure:
+    first: int
+    second: int
+    appearance_similarity: float
+    match_count: int
+    inlier_count: int
+    inlier_ratio: float
+    spatial_coverage: float
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def compute_frame_descriptors(
+    frame_paths: Sequence[str | Path], thumb_size: int = 48
+) -> np.ndarray:
+    """Normalized low-frequency colour descriptors used only for retrieval."""
+    descriptors = np.empty(
+        (len(frame_paths), thumb_size * thumb_size * 3), dtype=np.float32
+    )
     for row, path in enumerate(frame_paths):
-        thumbnail = Image.open(path).convert("L").resize((thumb_size, thumb_size), Image.BILINEAR)
-        vector = np.asarray(thumbnail, dtype=np.float32).reshape(-1)
-        vector -= vector.mean()
+        thumbnail = Image.open(path).convert("RGB").resize(
+            (thumb_size, thumb_size), Image.Resampling.BILINEAR
+        )
+        pixels = np.asarray(thumbnail, dtype=np.float32) / 255.0
+        pixels -= pixels.mean(axis=(0, 1), keepdims=True)
+        vector = pixels.reshape(-1)
         norm = np.linalg.norm(vector)
         descriptors[row] = vector / norm if norm > 1e-6 else vector
     return descriptors
 
 
-def find_loop_closure_candidates(
-    frame_paths: Sequence[str | Path],
-    min_frame_gap: int = 10,
-    top_k_per_frame: int = 2,
-    similarity_threshold: float = 0.6,
-) -> list[tuple[int, int]]:
-    """Non-adjacent frame-index pairs whose thumbnails are similar enough to
-    plausibly show the same physical area.
+def _orb_features(path: str | Path, max_features: int):
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Could not read frame: {path}")
+    scale = min(1.0, 960.0 / max(image.shape))
+    if scale < 1.0:
+        image = cv2.resize(
+            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+    detector = cv2.ORB_create(
+        nfeatures=max_features,
+        scaleFactor=1.2,
+        nlevels=8,
+        edgeThreshold=19,
+        fastThreshold=12,
+    )
+    keypoints, descriptors = detector.detectAndCompute(image, None)
+    return keypoints, descriptors, image.shape[:2]
 
-    min_frame_gap: only consider pairs already outside DUSt3R's own temporal
-    window (no point re-adding a pair swin-N already covers).
-    top_k_per_frame: cap candidates per frame so a handful of generic-looking
-    frames (e.g. a blank wall) can't flood the pair graph with weak matches.
-    similarity_threshold: cosine similarity in [-1, 1]; 0.6 is a deliberately
-    conservative starting point -- false-positive candidate pairs just get
-    caught by the cross-view consistency gate downstream, so this only needs
-    to avoid flooding DUSt3R with obviously-unrelated pairs, not be exact.
-    """
+
+def _grid_coverage(
+    points: np.ndarray, image_shape: tuple[int, int], grid_size: int = 4
+) -> float:
+    """Fraction of image grid cells containing an inlier correspondence."""
+    if not len(points):
+        return 0.0
+    height, width = image_shape
+    x = np.clip(
+        (points[:, 0] / max(width, 1) * grid_size).astype(int), 0, grid_size - 1
+    )
+    y = np.clip(
+        (points[:, 1] / max(height, 1) * grid_size).astype(int), 0, grid_size - 1
+    )
+    return len(set(zip(x.tolist(), y.tolist()))) / float(grid_size * grid_size)
+
+
+def _verify_pair(
+    first_features,
+    second_features,
+    *,
+    ratio_test: float,
+    ransac_threshold_px: float,
+    min_matches: int,
+    min_inliers: int,
+    min_inlier_ratio: float,
+    min_spatial_coverage: float,
+):
+    keypoints_a, descriptors_a, shape_a = first_features
+    keypoints_b, descriptors_b, _shape_b = second_features
+    if descriptors_a is None or descriptors_b is None:
+        return None
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    neighbors = matcher.knnMatch(descriptors_a, descriptors_b, k=2)
+    good = [
+        pair[0]
+        for pair in neighbors
+        if len(pair) == 2 and pair[0].distance < ratio_test * pair[1].distance
+    ]
+    if len(good) < min_matches:
+        return None
+    points_a = np.float32([keypoints_a[match.queryIdx].pt for match in good])
+    points_b = np.float32([keypoints_b[match.trainIdx].pt for match in good])
+    _matrix, mask = cv2.findFundamentalMat(
+        points_a, points_b, cv2.FM_RANSAC, ransac_threshold_px, 0.999
+    )
+    if mask is None:
+        return None
+    inliers = mask.reshape(-1).astype(bool)
+    inlier_count = int(inliers.sum())
+    inlier_ratio = inlier_count / len(good)
+    coverage = _grid_coverage(points_a[inliers], shape_a)
+    if (
+        inlier_count < min_inliers
+        or inlier_ratio < min_inlier_ratio
+        or coverage < min_spatial_coverage
+    ):
+        return None
+    return len(good), inlier_count, inlier_ratio, coverage
+
+
+def find_verified_loop_closures(
+    frame_paths: Sequence[str | Path],
+    *,
+    min_frame_gap: int = 8,
+    retrieval_candidates_per_frame: int = 8,
+    max_verified_per_frame: int = 3,
+    similarity_threshold: float = 0.35,
+    max_features: int = 2500,
+    ratio_test: float = 0.78,
+    ransac_threshold_px: float = 1.5,
+    min_matches: int = 28,
+    min_inliers: int = 20,
+    min_inlier_ratio: float = 0.35,
+    min_spatial_coverage: float = 0.20,
+) -> list[VerifiedLoopClosure]:
+    """Retrieve and geometrically verify non-temporal room revisits."""
+    if len(frame_paths) < 2:
+        return []
     descriptors = compute_frame_descriptors(frame_paths)
     similarity = descriptors @ descriptors.T
-    frame_count = len(frame_paths)
-    frame_indices = np.arange(frame_count)
+    indices = np.arange(len(frame_paths))
+    proposed: set[tuple[int, int]] = set()
+    for first in range(len(frame_paths)):
+        allowed = np.abs(indices - first) >= min_frame_gap
+        scores = np.where(allowed, similarity[first], -np.inf)
+        for second in np.argsort(scores)[::-1][:retrieval_candidates_per_frame]:
+            if scores[second] >= similarity_threshold:
+                proposed.add((min(first, int(second)), max(first, int(second))))
 
-    candidates: set[tuple[int, int]] = set()
-    for i in range(frame_count):
-        far_enough = np.abs(frame_indices - i) >= min_frame_gap
-        scores = np.where(far_enough, similarity[i], -np.inf)
-        ranked = np.argsort(scores)[::-1][:top_k_per_frame]
-        for j in ranked:
-            if scores[j] >= similarity_threshold:
-                candidates.add((int(min(i, j)), int(max(i, j))))
-    return sorted(candidates)
+    features = [_orb_features(path, max_features) for path in frame_paths]
+    accepted: list[VerifiedLoopClosure] = []
+    for first, second in sorted(
+        proposed, key=lambda pair: similarity[pair], reverse=True
+    ):
+        verified = _verify_pair(
+            features[first],
+            features[second],
+            ratio_test=ratio_test,
+            ransac_threshold_px=ransac_threshold_px,
+            min_matches=min_matches,
+            min_inliers=min_inliers,
+            min_inlier_ratio=min_inlier_ratio,
+            min_spatial_coverage=min_spatial_coverage,
+        )
+        if verified is None:
+            continue
+        match_count, inlier_count, inlier_ratio, coverage = verified
+        accepted.append(
+            VerifiedLoopClosure(
+                first,
+                second,
+                float(similarity[first, second]),
+                match_count,
+                inlier_count,
+                inlier_ratio,
+                coverage,
+            )
+        )
+
+    counts = np.zeros(len(frame_paths), dtype=int)
+    balanced: list[VerifiedLoopClosure] = []
+    for edge in sorted(
+        accepted,
+        key=lambda item: (item.inlier_count, item.spatial_coverage),
+        reverse=True,
+    ):
+        if (
+            counts[edge.first] >= max_verified_per_frame
+            or counts[edge.second] >= max_verified_per_frame
+        ):
+            continue
+        balanced.append(edge)
+        counts[edge.first] += 1
+        counts[edge.second] += 1
+    return sorted(balanced, key=lambda edge: (edge.first, edge.second))
+
+
+def find_loop_closure_candidates(
+    frame_paths: Sequence[str | Path], **kwargs
+) -> list[tuple[int, int]]:
+    """Compatibility wrapper returning only verified pair indices."""
+    return [
+        (edge.first, edge.second)
+        for edge in find_verified_loop_closures(frame_paths, **kwargs)
+    ]

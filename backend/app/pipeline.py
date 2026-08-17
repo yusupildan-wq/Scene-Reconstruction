@@ -47,33 +47,42 @@ def extract_frames(
         raise ValueError(f"Could not open video file: {video_path}")
 
     frame_index = 0
-    selected_paths: list[Path] = []
+    selected_frames: list[tuple[Path, float]] = []
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
             if frame_index % sample_every_n_frames == 0:
-                if _blur_score(frame) >= blur_threshold:
+                sharpness = _blur_score(frame)
+                if sharpness >= blur_threshold:
                     frame_path = output_dir / f"frame_{frame_index:06d}.jpg"
                     cv2.imwrite(str(frame_path), frame)
-                    selected_paths.append(frame_path)
+                    selected_frames.append((frame_path, sharpness))
             frame_index += 1
     finally:
         capture.release()
 
-    # DUSt3R cost grows with the number of images/pairs. For long captures,
-    # retain a uniformly distributed subset rather than simply taking the
-    # earliest sharp frames; this preserves every part of a full-room loop.
-    if max_selected_frames and len(selected_paths) > max_selected_frames:
-        keep_indices = np.linspace(
-            0, len(selected_paths) - 1, max_selected_frames, dtype=int
-        )
-        keep = {selected_paths[index] for index in keep_indices}
-        for path in selected_paths:
+    # Split the entire capture timeline into equal bins and take the sharpest
+    # candidate from each bin. The previous uniform-index subsampling preserved
+    # time coverage but could retain a barely-passing motion-blurred frame while
+    # deleting a much sharper frame only moments away. Dense reconstruction
+    # needs both coverage AND crisp texture for correspondence and supervision.
+    if max_selected_frames and len(selected_frames) > max_selected_frames:
+        bin_edges = np.linspace(0, len(selected_frames), max_selected_frames + 1)
+        keep: set[Path] = set()
+        for bin_index in range(max_selected_frames):
+            start = int(np.floor(bin_edges[bin_index]))
+            stop = int(np.floor(bin_edges[bin_index + 1]))
+            stop = max(stop, start + 1)
+            path, _score = max(selected_frames[start:stop], key=lambda item: item[1])
+            keep.add(path)
+        for path, _score in selected_frames:
             if path not in keep:
                 path.unlink()
-        selected_paths = [path for path in selected_paths if path in keep]
+        selected_frames = [item for item in selected_frames if item[0] in keep]
+
+    selected_paths = [path for path, _score in selected_frames]
 
     return FrameExtractionResult(
         frame_paths=selected_paths,
