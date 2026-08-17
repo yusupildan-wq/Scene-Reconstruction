@@ -44,13 +44,30 @@ def diagnose_cross_view_consistency(
     camera_viewmats: Sequence[np.ndarray],
     intrinsics,
     to_numpy: Callable,
+    pairs: Sequence[tuple[int, int]] | None = None,
+    max_median_relative_depth_error: float | None = None,
+    max_p95_relative_depth_error: float | None = None,
+    label: str = "adjacent",
 ) -> dict[str, float]:
-    """Compare adjacent views using geometry predicted independently per image.
+    """Compare views using geometry predicted independently per image.
 
-    For each directed adjacent pair i->j, world points from i are projected
-    into j. At the resulting target pixels we compare projected depth with j's
-    own depth and source color with j's observed color. Occluded points are
-    excluded from the color summary using a 5% relative-depth agreement gate.
+    For each directed pair i->j, world points from i are projected into j. At
+    the resulting target pixels we compare projected depth with j's own depth
+    and source color with j's observed color. Occluded points are excluded
+    from the color summary using a 5% relative-depth agreement gate.
+
+    `pairs`: undirected (i, j) index pairs to check, each checked in both
+    directions. Defaults to temporally-adjacent pairs (i, i+1) -- the original
+    behavior of this function. Pass the loop-closure candidates from
+    find_loop_closure_candidates() to specifically check whether frames that
+    plausibly revisit the same physical area actually agree geometrically --
+    that's a different, and for the "cross-room consistency" bottleneck a more
+    informative, question than whether consecutive frames agree.
+
+    If either max_*_error threshold is given and exceeded, raises RuntimeError
+    -- matching the hard-stop pattern already used by the reprojection-error
+    gate elsewhere in the pipeline, instead of only printing a report a human
+    has to remember to read before spending GPU time.
     """
     point_maps = [to_numpy(points) for points in pts3d]
     valid_masks = [to_numpy(mask).astype(bool) for mask in masks]
@@ -78,8 +95,13 @@ def diagnose_cross_view_consistency(
     all_depth_errors: list[np.ndarray] = []
     all_color_errors: list[np.ndarray] = []
 
-    directed_pairs = [(i, i + 1) for i in range(len(point_maps) - 1)]
-    directed_pairs += [(j, i) for i, j in directed_pairs]
+    if pairs is None:
+        undirected_pairs = [(i, i + 1) for i in range(len(point_maps) - 1)]
+    else:
+        undirected_pairs = list(pairs)
+    directed_pairs = list(undirected_pairs) + [(j, i) for i, j in undirected_pairs]
+    if not directed_pairs:
+        raise RuntimeError(f"No {label} pairs were provided to check.")
     for source_index, target_index in directed_pairs:
         source_points = point_maps[source_index].reshape(-1, 3)
         source_mask = valid_masks[source_index].reshape(-1)
@@ -152,7 +174,7 @@ def diagnose_cross_view_consistency(
             all_color_errors.append(color_error[depth_consistent])
 
     if not all_depth_errors:
-        raise RuntimeError("No adjacent-view overlap was measurable; stop before Gaussian training.")
+        raise RuntimeError(f"No {label} overlap was measurable; stop before Gaussian training.")
 
     depth_errors = np.concatenate(all_depth_errors)
     color_errors = np.concatenate(all_color_errors) if all_color_errors else np.asarray([np.nan])
@@ -162,11 +184,12 @@ def diagnose_cross_view_consistency(
         "p95_relative_depth_error": float(np.percentile(depth_errors, 95)),
         "median_color_mae": float(np.nanmedian(color_errors)),
     }
-    print("Cross-view consistency:")
+    print(f"Cross-view consistency ({label} pairs, {len(undirected_pairs)} checked):")
     for name, value in summary.items():
         print(f"  {name}: {value:.5f}")
 
     fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+    fig.suptitle(f"Adjacent-view geometry and appearance consistency ({label} pairs)")
     axes[0].bar(pair_labels, overlaps)
     axes[0].set_ylabel("Valid overlap fraction")
     axes[1].bar(pair_labels, depth_medians)
@@ -174,7 +197,23 @@ def diagnose_cross_view_consistency(
     axes[2].bar(pair_labels, color_medians)
     axes[2].set_ylabel("Median RGB MAE")
     axes[2].tick_params(axis="x", rotation=90)
-    fig.suptitle("Adjacent-view geometry and appearance consistency")
     fig.tight_layout()
     plt.show()
+
+    if (
+        max_median_relative_depth_error is not None
+        and summary["median_relative_depth_error"] > max_median_relative_depth_error
+    ) or (
+        max_p95_relative_depth_error is not None
+        and summary["p95_relative_depth_error"] > max_p95_relative_depth_error
+    ):
+        raise RuntimeError(
+            f"{label.capitalize()}-pair geometry is inconsistent "
+            f"(median_relative_depth_error={summary['median_relative_depth_error']:.4f}, "
+            f"p95={summary['p95_relative_depth_error']:.4f}) -- stop before Gaussian training "
+            "and inspect the plot above. This is the diagnostic CLAUDE_HANDOFF.md calls for: "
+            "self-reprojection alone can't catch this because a bad camera pose and its own bad "
+            "depth map can agree with each other -- this checks whether INDEPENDENTLY predicted "
+            f"geometry from two different '{label}' views agrees."
+        )
     return summary

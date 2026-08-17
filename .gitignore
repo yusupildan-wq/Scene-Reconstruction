@@ -15,3 +15,5 @@ experiments/artifacts/**/*.npz
 experiments/artifacts/**/*_executed.ipynb
 experiments/artifacts/**/frames/
 experiments/artifacts/**/contact_sheet.jpg
+experiments/artifacts/**/*.bin
+experiments/artifacts/**/*_cameras.json

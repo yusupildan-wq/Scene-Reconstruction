@@ -170,78 +170,6 @@ def _init_gaussians_from_points(xyz: np.ndarray, rgb: np.ndarray, device: torch.
     return means, quats, scales, opacities, colors, max_log_scale
 
 
-def _densify_and_prune(
-    means: torch.Tensor,
-    quats: torch.Tensor,
-    scales: torch.Tensor,
-    opacities: torch.Tensor,
-    colors: torch.Tensor,
-    xyz_grad_accum: torch.Tensor,
-    xyz_grad_count: torch.Tensor,
-    max_log_scale: float,
-    device: torch.device,
-    grad_threshold: float = 0.0002,
-    prune_opacity_threshold: float = 0.005,
-):
-    """Adaptive density control: grow detail where training is struggling, remove
-    Gaussians that faded to near-invisible. This is what lets the scene end up
-    with more than the fixed number of points SfM originally gave it.
-
-    A Gaussian's *position* gradient tells us how much moving it would reduce
-    loss -- large accumulated gradient over many steps means it's being pulled
-    in inconsistent directions, a sign one Gaussian is trying (and failing) to
-    cover a region that really needs several. Small-and-struggling gets CLONED
-    (duplicated, so the copy can specialize); large-and-struggling gets SPLIT
-    into two smaller ones sampled near the original. Opacity near zero means a
-    Gaussian contributes almost nothing to any render -- PRUNED (removed).
-    """
-    avg_grad = xyz_grad_accum / xyz_grad_count.clamp(min=1)
-    real_scales = torch.exp(scales)
-    real_opacities = torch.sigmoid(opacities)
-
-    high_grad = avg_grad > grad_threshold
-    is_large = real_scales.max(dim=-1).values > 0.5 * np.exp(max_log_scale)
-    split_mask = high_grad & is_large
-    clone_mask = high_grad & ~is_large
-    prune_mask = real_opacities < prune_opacity_threshold
-
-    keep_mask = ~(split_mask | prune_mask)
-
-    new_means = [means[keep_mask]]
-    new_quats = [quats[keep_mask]]
-    new_scales = [scales[keep_mask]]
-    new_opacities = [opacities[keep_mask]]
-    new_colors = [colors[keep_mask]]
-
-    if clone_mask.any():
-        new_means.append(means[clone_mask])
-        new_quats.append(quats[clone_mask])
-        new_scales.append(scales[clone_mask])
-        new_opacities.append(opacities[clone_mask])
-        new_colors.append(colors[clone_mask])
-
-    if split_mask.any():
-        n_split = int(split_mask.sum().item())
-        # Two children per split Gaussian, offset randomly within roughly its own
-        # extent, scaled down (a standard 3DGS convention) so total coverage stays
-        # similar instead of ballooning.
-        for _ in range(2):
-            offset = torch.randn(n_split, 3, device=device) * real_scales[split_mask]
-            new_means.append((means[split_mask] + offset).detach())
-            new_quats.append(quats[split_mask].detach())
-            new_scales.append((scales[split_mask] - np.log(1.6)).detach())
-            new_opacities.append(opacities[split_mask].detach())
-            new_colors.append(colors[split_mask].detach())
-
-    means = torch.cat(new_means).detach().requires_grad_(True)
-    quats = torch.cat(new_quats).detach().requires_grad_(True)
-    scales = torch.cat(new_scales).detach().requires_grad_(True)
-    opacities = torch.cat(new_opacities).detach().requires_grad_(True)
-    colors = torch.cat(new_colors).detach().requires_grad_(True)
-
-    return means, quats, scales, opacities, colors
-
-
 def _colmap_camera_to_K(camera: pycolmap.Camera) -> np.ndarray:
     # Ignoring lens distortion params here (e.g. SIMPLE_RADIAL's k) for the first
     # version -- a real simplification, not an oversight; revisit if training
@@ -462,7 +390,14 @@ def train_gaussian_splatting(
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
     with adaptive density control (split/clone/prune) growing detail beyond
-    SfM's original fixed point count -- see _densify_and_prune.
+    SfM's original fixed point count -- via gsplat's own DefaultStrategy
+    (nerfstudio-project/gsplat), not a hand-rolled implementation: it follows
+    the same split/clone/prune algorithm as the original 3DGS paper, and using
+    the library's own tested version instead of reimplementing it is what
+    made per-parameter Adam optimizers (see _make_optimizers) necessary in
+    the first place -- DefaultStrategy's split/prune operations need to edit
+    each parameter's Adam state directly, which a single multi-group
+    optimizer doesn't expose.
 
     Backend-agnostic: only depends on ReconstructedScene's plain arrays, not on
     COLMAP specifically -- DUSt3R (or anything else) can feed this the same way.
@@ -689,6 +624,125 @@ def train_gaussian_splatting(
         camera_pose_optimizer,
     )
     return gaussians, state
+
+
+def save_training_state(state: GaussianTrainingState, path: Path) -> None:
+    """Serialize resumable Gaussian training state to disk.
+
+    UNVALIDATED UNTIL A REAL COLAB/RUNPOD RUN exercises a save+load+continue
+    cycle end to end -- the in-memory resume path (training_state passed
+    straight back into train_gaussian_splatting within one Python process)
+    has real Colab T4 usage; round-tripping through disk has not been tested.
+
+    Without this, a Colab disconnect mid-training loses everything: Adam's
+    per-parameter momentum/variance and DefaultStrategy's accumulated
+    screen-space gradient statistics are real optimization state, not just
+    the current Gaussian values -- reloading only the exported
+    means/quats/scales/opacities/colors and calling train_gaussian_splatting
+    again would silently restart optimization dynamics from zero even though
+    the visible Gaussians look unchanged. This is exactly the "persist each
+    stage so a failure never requires starting over" requirement in
+    CLAUDE_HANDOFF.md.
+
+    `strategy` itself isn't saved -- gsplat's DefaultStrategy (verified
+    against its real source) holds no learned state, only the
+    refine_start_iter/refine_stop_iter/refine_every config it was
+    constructed with. That config is saved and used to reconstruct an
+    equivalent DefaultStrategy on load instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "params": {name: tensor.detach().cpu() for name, tensor in state.params.items()},
+            "optimizers": {name: opt.state_dict() for name, opt in state.optimizers.items()},
+            "strategy_config": {
+                "refine_start_iter": state.strategy.refine_start_iter,
+                "refine_stop_iter": state.strategy.refine_stop_iter,
+                "refine_every": state.strategy.refine_every,
+            },
+            "strategy_state": {
+                key: (value.detach().cpu() if torch.is_tensor(value) else value)
+                for key, value in state.strategy_state.items()
+            },
+            "step": state.step,
+            "learning_rate_decay_applied": state.learning_rate_decay_applied,
+            "exposure_log_gains": (
+                state.exposure_log_gains.detach().cpu() if state.exposure_log_gains is not None else None
+            ),
+            "exposure_biases": (
+                state.exposure_biases.detach().cpu() if state.exposure_biases is not None else None
+            ),
+            "exposure_optimizer": (
+                state.exposure_optimizer.state_dict() if state.exposure_optimizer is not None else None
+            ),
+            "sh_degree": state.sh_degree,
+            "camera_pose_deltas": (
+                state.camera_pose_deltas.detach().cpu() if state.camera_pose_deltas is not None else None
+            ),
+            "camera_pose_optimizer": (
+                state.camera_pose_optimizer.state_dict() if state.camera_pose_optimizer is not None else None
+            ),
+        },
+        path,
+    )
+
+
+def load_training_state(path: Path, device: torch.device) -> GaussianTrainingState:
+    """Inverse of save_training_state -- see its docstring for what's saved and why."""
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    params = torch.nn.ParameterDict(
+        {name: torch.nn.Parameter(tensor.to(device)) for name, tensor in checkpoint["params"].items()}
+    )
+    optimizers = _make_optimizers(params)
+    for name, optimizer in optimizers.items():
+        optimizer.load_state_dict(checkpoint["optimizers"][name])
+
+    strategy = DefaultStrategy(
+        refine_start_iter=checkpoint["strategy_config"]["refine_start_iter"],
+        refine_stop_iter=checkpoint["strategy_config"]["refine_stop_iter"],
+        refine_every=checkpoint["strategy_config"]["refine_every"],
+        verbose=True,
+    )
+    strategy_state = {
+        key: (value.to(device) if torch.is_tensor(value) else value)
+        for key, value in checkpoint["strategy_state"].items()
+    }
+
+    def _load_optional_param(key: str) -> torch.nn.Parameter | None:
+        value = checkpoint[key]
+        return torch.nn.Parameter(value.to(device)) if value is not None else None
+
+    exposure_log_gains = _load_optional_param("exposure_log_gains")
+    exposure_biases = _load_optional_param("exposure_biases")
+    exposure_optimizer = None
+    if checkpoint["exposure_optimizer"] is not None:
+        # lr is a required constructor arg but gets fully overwritten by
+        # load_state_dict below (it restores each param_group's saved lr) --
+        # same reasoning for camera_pose_optimizer further down.
+        exposure_optimizer = torch.optim.Adam([exposure_log_gains, exposure_biases], lr=1e-3)
+        exposure_optimizer.load_state_dict(checkpoint["exposure_optimizer"])
+
+    camera_pose_deltas = _load_optional_param("camera_pose_deltas")
+    camera_pose_optimizer = None
+    if checkpoint["camera_pose_optimizer"] is not None:
+        camera_pose_optimizer = torch.optim.Adam([camera_pose_deltas], lr=1e-5)
+        camera_pose_optimizer.load_state_dict(checkpoint["camera_pose_optimizer"])
+
+    return GaussianTrainingState(
+        params=params,
+        optimizers=optimizers,
+        strategy=strategy,
+        strategy_state=strategy_state,
+        step=checkpoint["step"],
+        learning_rate_decay_applied=checkpoint["learning_rate_decay_applied"],
+        exposure_log_gains=exposure_log_gains,
+        exposure_biases=exposure_biases,
+        exposure_optimizer=exposure_optimizer,
+        sh_degree=checkpoint["sh_degree"],
+        camera_pose_deltas=camera_pose_deltas,
+        camera_pose_optimizer=camera_pose_optimizer,
+    )
 
 
 def evaluate_and_upload(job: JobPayload, gaussians: dict) -> dict:

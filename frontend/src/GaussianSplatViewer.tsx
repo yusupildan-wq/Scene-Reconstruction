@@ -56,6 +56,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
   const [loaded, setLoaded] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
   const [activeView, setActiveView] = useState(15);
+  const [viewOptions, setViewOptions] = useState([0, 7, 15, 23, 31]);
 
   const jumpToTrainingView = (viewIndex: number) => {
     const camera = cameraRef.current;
@@ -166,9 +167,13 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
 
         if (cameraPoses && cameraPoses.length > 0) {
           cameraPosesRef.current = cameraPoses;
+          const lastView = cameraPoses.length - 1;
+          setViewOptions(
+            Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((fraction) => Math.round(lastView * fraction))))
+          );
           // Real photo vantage point: guaranteed to be open, photographed
           // space, not guessed geometry.
-          const initialView = Math.min(15, cameraPoses.length - 1);
+          const initialView = Math.floor((cameraPoses.length - 1) / 2);
           const pose = cameraPoses[initialView];
           const position = new THREE.Vector3();
           const quaternion = new THREE.Quaternion();
@@ -278,7 +283,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
           }}
         >
           <span style={{ alignSelf: "center", marginRight: 4 }}>Training camera:</span>
-          {[0, 7, 15, 23, 31].map((viewIndex) => (
+          {viewOptions.map((viewIndex) => (
             <button
               key={viewIndex}
               type="button"
