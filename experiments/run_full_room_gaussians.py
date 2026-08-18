@@ -151,6 +151,58 @@ def load_scene(run_dir: Path, target_long_edge: int, max_initial_points: int):
     return scene, report
 
 
+def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
+    import torch
+    from gsplat import rasterization
+    from runner import _ssim
+
+    exports = sorted(run_dir.glob("gaussians_step*.npz"))
+    if not exports:
+        raise RuntimeError(f"No Gaussian export found in {run_dir}")
+    export = exports[-1]
+    data = np.load(export)
+    device = torch.device("cuda")
+    means = torch.tensor(data["means"], device=device)
+    quats = torch.tensor(data["quats"], device=device)
+    scales = torch.tensor(data["scales"], device=device)
+    opacities = torch.tensor(data["opacities"], device=device)
+    colors = torch.tensor(data["colors"], device=device)
+    indices = np.linspace(0, len(scene.camera_images) - 1, views, dtype=int)
+    metrics, rows = [], []
+    with torch.no_grad():
+        for index in indices:
+            target = torch.tensor(scene.camera_images[index], device=device)
+            height, width = target.shape[:2]
+            render, _, _ = rasterization(
+                means, quats, scales, opacities, colors,
+                torch.tensor(scene.camera_viewmats[index], device=device).unsqueeze(0),
+                torch.tensor(scene.camera_Ks[index], device=device).unsqueeze(0),
+                width, height,
+            )
+            rendered = render[0].clamp(0, 1)
+            mse = torch.mean((rendered - target) ** 2)
+            psnr = float(-10.0 * torch.log10(mse.clamp_min(1e-12)))
+            ssim = float(_ssim(rendered, target))
+            metrics.append({"view": int(index), "psnr": psnr, "ssim": ssim})
+            real_u8 = (target.cpu().numpy() * 255).astype(np.uint8)
+            render_u8 = (rendered.cpu().numpy() * 255).astype(np.uint8)
+            rows.append(np.concatenate((real_u8, render_u8), axis=1))
+    report = {
+        "source": export.name,
+        "mean_psnr": float(np.mean([item["psnr"] for item in metrics])),
+        "mean_ssim": float(np.mean([item["ssim"] for item in metrics])),
+        "views": metrics,
+    }
+    report_path = run_dir / "evaluation_latest.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    montage = Image.fromarray(np.concatenate(rows, axis=0))
+    montage.thumbnail((1600, 10000), Image.Resampling.LANCZOS)
+    montage_path = run_dir / "evaluation_latest.jpg"
+    montage.save(montage_path, quality=92)
+    print(json.dumps(report, indent=2))
+    print(f"Evaluation montage: {montage_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", type=Path)
@@ -158,6 +210,7 @@ def main() -> None:
     parser.add_argument("--target-long-edge", type=int, default=1024)
     parser.add_argument("--max-initial-points", type=int, default=160_000)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--evaluate-only", action="store_true")
     args = parser.parse_args()
 
     scene, report = load_scene(
@@ -168,6 +221,9 @@ def main() -> None:
     print(json.dumps(report, indent=2), flush=True)
     if args.validate_only:
         print(f"Validation complete: {report_path}")
+        return
+    if args.evaluate_only:
+        evaluate_latest(scene, args.run_dir)
         return
 
     import torch
