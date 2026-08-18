@@ -8,6 +8,14 @@
 # nohup-safe (see the bottom) so an SSH/agent disconnect doesn't kill it.
 set -euo pipefail
 
+# Real failure hit on the third run: COLMAP's apt-packaged build tries to
+# initialize a Qt GUI context even for pure CLI feature extraction/matching,
+# and this pod is headless (no X display) -- crashed with "qt.qpa.xcb: could
+# not connect to display". QT_QPA_PLATFORM=offscreen forces Qt to use a
+# headless-safe rendering backend instead of trying to reach a real display.
+# Standard, well-known fix for exactly this error on headless Linux servers.
+export QT_QPA_PLATFORM=offscreen
+
 OUT=/workspace/v2-reconstruction
 VIDEO=/workspace/IMG_1705.mov
 mkdir -p "$OUT"
