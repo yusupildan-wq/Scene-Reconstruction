@@ -30,7 +30,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pycolmap
+try:
+    import pycolmap
+except ImportError:  # DUSt3R-only workers do not need COLMAP installed.
+    pycolmap = None
 import requests
 import torch
 import torch.nn.functional as F
@@ -118,6 +121,8 @@ def _download_frames(frame_urls: list[str], dest_dir: Path) -> None:
 
 def run_colmap_sfm(job: JobPayload, workdir: Path) -> ReconstructedScene:
     """Feature extraction -> matching -> sparse SfM (poses + sparse point cloud)."""
+    if pycolmap is None:
+        raise RuntimeError("COLMAP reconstruction requires the optional pycolmap package")
     images_dir = workdir / "images"
     _download_frames(job.frame_urls, images_dir)
 
