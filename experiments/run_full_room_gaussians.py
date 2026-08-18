@@ -168,6 +168,79 @@ def cross_view_diagnostics(points, masks, intrinsics, poses, radius: int = 2) ->
     }
 
 
+def cross_view_diagnostics_from_checkpoint(
+    run_dir: Path, radius: int = 2
+) -> dict:
+    """Run cross-view checks with bounded RAM and no training dependencies."""
+    geometry = run_dir / "geometry"
+    marker = geometry / "COMPLETE.json"
+    if not marker.exists():
+        raise RuntimeError(f"Incomplete geometry checkpoint: {marker} is missing")
+    camera_data = np.load(geometry / "cameras.npz")
+    poses = camera_data["poses"].astype(np.float32)
+    intrinsics = camera_data["intrinsics"].astype(np.float32)
+    viewmats = [np.linalg.inv(pose).astype(np.float32) for pose in poses]
+    pair_metrics = []
+    per_view = [[] for _ in poses]
+    for source_index in range(len(poses)):
+        source_points = np.load(
+            geometry / f"points_{source_index:04d}.npy", mmap_mode="r"
+        )
+        source_mask = np.load(
+            geometry / f"mask_{source_index:04d}.npy", mmap_mode="r"
+        )
+        for target_index in range(
+            source_index + 1, min(len(poses), source_index + radius + 1)
+        ):
+            target_points = np.load(
+                geometry / f"points_{target_index:04d}.npy", mmap_mode="r"
+            )
+            target_mask = np.load(
+                geometry / f"mask_{target_index:04d}.npy", mmap_mode="r"
+            )
+            forward = _cross_view_pair_score(
+                source_points, source_mask, target_points, target_mask,
+                intrinsics[target_index], viewmats[target_index],
+            )
+            backward = _cross_view_pair_score(
+                target_points, target_mask, source_points, source_mask,
+                intrinsics[source_index], viewmats[source_index],
+            )
+            score = {
+                "source": source_index,
+                "target": target_index,
+                "overlap": float((forward["overlap"] + backward["overlap"]) / 2),
+                "median_relative_error": float(
+                    (forward["median_relative_error"] + backward["median_relative_error"]) / 2
+                ),
+                "inlier_ratio": float(
+                    (forward["inlier_ratio"] + backward["inlier_ratio"]) / 2
+                ),
+            }
+            pair_metrics.append(score)
+            per_view[source_index].append(score["inlier_ratio"])
+            per_view[target_index].append(score["inlier_ratio"])
+        print(f"Cross-view diagnostic: {source_index + 1}/{len(poses)} views", flush=True)
+    view_scores = [float(np.median(values)) if values else 0.0 for values in per_view]
+    finite_errors = [
+        item["median_relative_error"] for item in pair_metrics
+        if np.isfinite(item["median_relative_error"])
+    ]
+    return {
+        "radius": radius,
+        "relative_tolerance": 0.03,
+        "median_pair_inlier_ratio": float(
+            np.median([item["inlier_ratio"] for item in pair_metrics])
+        ),
+        "median_pair_relative_error": (
+            float(np.median(finite_errors)) if finite_errors else None
+        ),
+        "view_scores": view_scores,
+        "weak_views": [index for index, score in enumerate(view_scores) if score < 0.35],
+        "pairs": pair_metrics,
+    }
+
+
 def load_scene(run_dir: Path, target_long_edge: int, max_initial_points: int):
     from runner import ReconstructedScene
 
@@ -316,6 +389,15 @@ def main() -> None:
     parser.add_argument("--diagnose-cross-view", action="store_true")
     args = parser.parse_args()
 
+    if args.diagnose_cross_view:
+        diagnostics = cross_view_diagnostics_from_checkpoint(args.run_dir)
+        output = args.run_dir / "cross_view_diagnostics.json"
+        output.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+        summary = {key: value for key, value in diagnostics.items() if key != "pairs"}
+        print(json.dumps(summary, indent=2))
+        print(f"Cross-view diagnostics: {output}")
+        return
+
     scene, report = load_scene(
         args.run_dir, args.target_long_edge, args.max_initial_points
     )
@@ -324,20 +406,6 @@ def main() -> None:
     print(json.dumps(report, indent=2), flush=True)
     if args.validate_only:
         print(f"Validation complete: {report_path}")
-        return
-    if args.diagnose_cross_view:
-        geometry = args.run_dir / "geometry"
-        camera_data = np.load(geometry / "cameras.npz")
-        poses = camera_data["poses"].astype(np.float32)
-        intrinsics = camera_data["intrinsics"].astype(np.float32)
-        points = [np.load(geometry / f"points_{i:04d}.npy") for i in range(len(poses))]
-        masks = [np.load(geometry / f"mask_{i:04d}.npy").astype(bool) for i in range(len(poses))]
-        diagnostics = cross_view_diagnostics(points, masks, intrinsics, poses)
-        output = args.run_dir / "cross_view_diagnostics.json"
-        output.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
-        summary = {key: value for key, value in diagnostics.items() if key != "pairs"}
-        print(json.dumps(summary, indent=2))
-        print(f"Cross-view diagnostics: {output}")
         return
     if args.evaluate_only:
         evaluate_latest(scene, args.run_dir)
