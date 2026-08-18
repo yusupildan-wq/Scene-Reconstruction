@@ -90,14 +90,17 @@ else
   echo "COLMAP output already present, skipping"
 fi
 
-echo "=== [3/4] Train splatfacto with MCMC densification ==="
-# Defaults otherwise -- deliberately not hand-tuning hyperparameters for the
-# first real run, to test the mature implementation as intended before
-# customizing anything.
+echo "=== [3/4] Train splatfacto ==="
+# --pipeline.model.strategy mcmc dropped: the pip-published nerfstudio release
+# installed here predates MCMC-strategy support (confirmed via the real tyro
+# error -- "Unrecognized options: --pipeline.model.strategy, mcmc" -- not
+# guessed). That flag only exists on nerfstudio's unreleased GitHub main
+# branch, which is not what `pip install nerfstudio` gives us. Falling back to
+# splatfacto's actual installed default (its original split/clone/prune
+# DefaultStrategy) rather than chase exact-version flag compatibility further.
 ns-train splatfacto \
   --data "$OUT/data" \
   --output-dir "$OUT/training" \
-  --pipeline.model.strategy mcmc \
   --viewer.quit-on-train-completion True
 
 echo "=== [4/4] Export a standard .ply + render images for visual inspection ==="
