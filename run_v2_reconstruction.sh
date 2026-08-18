@@ -14,7 +14,13 @@ mkdir -p "$OUT"
 
 echo "=== [1/4] Install nerfstudio (pulls in gsplat + a compatible torch/CUDA build) ==="
 if ! command -v ns-train >/dev/null 2>&1; then
-  pip install -q nerfstudio
+  # This pod's base image has some packages (e.g. blinker) installed via apt,
+  # which leaves no pip RECORD file -- pip refuses to upgrade them by default
+  # ("Cannot uninstall blinker ... no RECORD file was found"). --ignore-installed
+  # tells pip to shadow the apt-installed version with its own instead of
+  # trying to uninstall it first. Real failure hit on the first attempt, not
+  # a preemptive guess.
+  pip install -q --ignore-installed blinker nerfstudio
 else
   echo "already installed, skipping"
 fi
