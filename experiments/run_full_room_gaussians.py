@@ -25,6 +25,45 @@ sys.path.insert(0, str(ROOT / "worker"))
 from experiments.convert_bin_to_ply import convert_npz
 
 
+PROFILES = {
+    "baseline": {
+        "iterations": 3000,
+        "target_long_edge": 1024,
+        "max_initial_points": 160_000,
+        "densify_until": 2400,
+        "learning_rate_decay_step": None,
+        "sh_degree": None,
+        "exclude_weak_views": False,
+    },
+    "photoreal": {
+        "iterations": 8000,
+        "target_long_edge": 1440,
+        "max_initial_points": 400_000,
+        "densify_until": 6000,
+        "learning_rate_decay_step": 7000,
+        "sh_degree": 2,
+        "exclude_weak_views": True,
+    },
+}
+
+
+def resolve_profile(name: str, args: argparse.Namespace) -> dict:
+    config = dict(PROFILES[name])
+    for key in ("iterations", "target_long_edge", "max_initial_points"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
+    return config
+
+
+def diagnostic_weak_views(run_dir: Path) -> list[int]:
+    path = run_dir / "cross_view_diagnostics.json"
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return sorted({int(index) for index in data.get("weak_views", [])})
+
+
 def _crop_region(width: int, height: int, size: int = 512, patch: int = 16):
     scale = size / max(width, height)
     resized_w, resized_h = round(width * scale), round(height * scale)
@@ -241,7 +280,12 @@ def cross_view_diagnostics_from_checkpoint(
     }
 
 
-def load_scene(run_dir: Path, target_long_edge: int, max_initial_points: int):
+def load_scene(
+    run_dir: Path,
+    target_long_edge: int,
+    max_initial_points: int,
+    excluded_view_indices: list[int] | None = None,
+):
     from runner import ReconstructedScene
 
     geometry = run_dir / "geometry"
@@ -257,8 +301,12 @@ def load_scene(run_dir: Path, target_long_edge: int, max_initial_points: int):
     masks = [np.load(geometry / f"mask_{i:04d}.npy").astype(bool) for i in range(len(poses))]
     counts = np.asarray([int(mask.sum()) for mask in masks])
     threshold = max(1, int(np.median(counts) * 0.1))
-    trusted = np.flatnonzero(counts >= threshold).tolist()
-    excluded = np.flatnonzero(counts < threshold).tolist()
+    forced_excluded = set(excluded_view_indices or [])
+    trusted = [
+        int(index) for index in np.flatnonzero(counts >= threshold)
+        if int(index) not in forced_excluded
+    ]
+    excluded = sorted(set(np.flatnonzero(counts < threshold).tolist()) | forced_excluded)
     if len(trusted) < 3:
         raise RuntimeError("Fewer than three geometrically supported views remain")
 
@@ -322,7 +370,7 @@ def load_scene(run_dir: Path, target_long_edge: int, max_initial_points: int):
     return scene, report
 
 
-def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
+def evaluate_latest(scene, output_dir: Path, views: int = 8) -> None:
     import torch
     from gsplat import rasterization
     from runner import _ssim
@@ -331,9 +379,9 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
         match = re.search(r"step(\d+)", path.stem)
         return int(match.group(1)) if match else -1
 
-    exports = sorted(run_dir.glob("gaussians_step*.npz"), key=step_number)
+    exports = sorted(output_dir.glob("gaussians_step*.npz"), key=step_number)
     if not exports:
-        raise RuntimeError(f"No Gaussian export found in {run_dir}")
+        raise RuntimeError(f"No Gaussian export found in {output_dir}")
     export = exports[-1]
     data = np.load(export)
     device = torch.device("cuda")
@@ -341,7 +389,9 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
     quats = torch.tensor(data["quats"], device=device)
     scales = torch.tensor(data["scales"], device=device)
     opacities = torch.tensor(data["opacities"], device=device)
-    colors = torch.tensor(data["colors"], device=device)
+    sh_degree = int(data["sh_degree"]) if "sh_degree" in data else None
+    color_key = "sh_coeffs" if sh_degree is not None else "colors"
+    colors = torch.tensor(data[color_key], device=device)
     indices = np.linspace(0, len(scene.camera_images) - 1, views, dtype=int)
     metrics, rows = [], []
     with torch.no_grad():
@@ -352,7 +402,7 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
                 means, quats, scales, opacities, colors,
                 torch.tensor(scene.camera_viewmats[index], device=device).unsqueeze(0),
                 torch.tensor(scene.camera_Ks[index], device=device).unsqueeze(0),
-                width, height,
+                width, height, sh_degree=sh_degree,
             )
             rendered = render[0].clamp(0, 1)
             mse = torch.mean((rendered - target) ** 2)
@@ -368,11 +418,11 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
         "mean_ssim": float(np.mean([item["ssim"] for item in metrics])),
         "views": metrics,
     }
-    report_path = run_dir / "evaluation_latest.json"
+    report_path = output_dir / "evaluation_latest.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     montage = Image.fromarray(np.concatenate(rows, axis=0))
     montage.thumbnail((1600, 10000), Image.Resampling.LANCZOS)
-    montage_path = run_dir / "evaluation_latest.jpg"
+    montage_path = output_dir / "evaluation_latest.jpg"
     montage.save(montage_path, quality=92)
     print(json.dumps(report, indent=2))
     print(f"Evaluation montage: {montage_path}")
@@ -381,13 +431,18 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--iterations", type=int, default=3000)
-    parser.add_argument("--target-long-edge", type=int, default=1024)
-    parser.add_argument("--max-initial-points", type=int, default=160_000)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--profile", choices=PROFILES, default="baseline")
+    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--target-long-edge", type=int)
+    parser.add_argument("--max-initial-points", type=int)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--diagnose-cross-view", action="store_true")
     args = parser.parse_args()
+    config = resolve_profile(args.profile, args)
+    output_dir = args.output_dir or args.run_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.diagnose_cross_view:
         diagnostics = cross_view_diagnostics_from_checkpoint(args.run_dir)
@@ -398,17 +453,22 @@ def main() -> None:
         print(f"Cross-view diagnostics: {output}")
         return
 
+    excluded = diagnostic_weak_views(args.run_dir) if config["exclude_weak_views"] else []
     scene, report = load_scene(
-        args.run_dir, args.target_long_edge, args.max_initial_points
+        args.run_dir,
+        config["target_long_edge"],
+        config["max_initial_points"],
+        excluded,
     )
-    report_path = args.run_dir / "geometry_validation.json"
+    report["profile"] = args.profile
+    report_path = output_dir / "geometry_validation.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
     if args.validate_only:
         print(f"Validation complete: {report_path}")
         return
     if args.evaluate_only:
-        evaluate_latest(scene, args.run_dir)
+        evaluate_latest(scene, output_dir)
         return
 
     import torch
@@ -416,26 +476,28 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("Gaussian training requires a CUDA GPU")
-    checkpoints = args.run_dir / "checkpoints"
+    checkpoints = output_dir / "checkpoints"
     checkpoints.mkdir(parents=True, exist_ok=True)
     latest = checkpoints / "training_state_latest.pt"
     state = load_training_state(latest, torch.device("cuda")) if latest.exists() else None
     start_step = state.step if state is not None else 0
     gaussians, state = train_gaussian_splatting(
         scene,
-        num_iterations=args.iterations,
-        densify_until=2400,
+        num_iterations=config["iterations"],
+        densify_until=config["densify_until"],
         training_state=state,
         optimize_camera_exposure=True,
         optimize_camera_poses=False,
+        learning_rate_decay_step=config["learning_rate_decay_step"],
+        sh_degree=config["sh_degree"],
         return_training_state=True,
     )
     save_training_state(state, latest)
     state_copy = checkpoints / f"training_state_step{state.step}.pt"
     save_training_state(state, state_copy)
-    export = args.run_dir / f"gaussians_step{state.step}.npz"
+    export = output_dir / f"gaussians_step{state.step}.npz"
     np.savez(export, **gaussians)
-    ply = args.run_dir / f"gaussians_step{state.step}.ply"
+    ply = output_dir / f"gaussians_step{state.step}.ply"
     convert_npz(export, ply)
     print(
         f"Training complete: step {start_step} -> {state.step}, "

@@ -55,10 +55,11 @@ def convert_npz(npz_path: Path, ply_path: Path) -> None:
         scales = scene["scales"].astype(np.float32)
         opacities = scene["opacities"].astype(np.float32)
         colors = scene["colors"].astype(np.float32)
-    _write_scene(ply_path, means, quats, scales, opacities, colors)
+        sh_coeffs = scene["sh_coeffs"].astype(np.float32) if "sh_coeffs" in scene else None
+    _write_scene(ply_path, means, quats, scales, opacities, colors, sh_coeffs=sh_coeffs)
 
 
-def _write_scene(ply_path, means, quats, scales, opacities, colors):
+def _write_scene(ply_path, means, quats, scales, opacities, colors, sh_coeffs=None):
     ply_path.parent.mkdir(parents=True, exist_ok=True)
     n = len(means)
 
@@ -83,7 +84,16 @@ def _write_scene(ply_path, means, quats, scales, opacities, colors):
 
     log_scales = np.log(np.clip(scales, 1e-8, None))
     logit_opacities = np.log(np.clip(opacities, 1e-6, 1 - 1e-6) / (1 - np.clip(opacities, 1e-6, 1 - 1e-6)))
-    f_dc = (colors - 0.5) / SH_C0
+    if sh_coeffs is not None:
+        if sh_coeffs.ndim != 3 or sh_coeffs.shape[0] != n or sh_coeffs.shape[2] != 3:
+            raise ValueError(f"Expected sh_coeffs shaped (N, K, 3), got {sh_coeffs.shape}")
+        f_dc = sh_coeffs[:, 0, :]
+        # The standard 3DGS PLY layout groups the remaining coefficients by
+        # color channel: R coefficients, then G, then B.
+        f_rest = sh_coeffs[:, 1:, :].transpose(0, 2, 1).reshape(n, -1)
+    else:
+        f_dc = (colors - 0.5) / SH_C0
+        f_rest = np.empty((n, 0), dtype=np.float32)
     normals = np.zeros_like(means)
 
     dtype = [
@@ -94,10 +104,13 @@ def _write_scene(ply_path, means, quats, scales, opacities, colors):
         ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
         ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
     ]
+    dtype[9:9] = [(f"f_rest_{index}", "f4") for index in range(f_rest.shape[1])]
     vertices = np.empty(n, dtype=dtype)
     vertices["x"], vertices["y"], vertices["z"] = means[:, 0], means[:, 1], means[:, 2]
     vertices["nx"], vertices["ny"], vertices["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
     vertices["f_dc_0"], vertices["f_dc_1"], vertices["f_dc_2"] = f_dc[:, 0], f_dc[:, 1], f_dc[:, 2]
+    for index in range(f_rest.shape[1]):
+        vertices[f"f_rest_{index}"] = f_rest[:, index]
     vertices["opacity"] = logit_opacities
     vertices["scale_0"], vertices["scale_1"], vertices["scale_2"] = log_scales[:, 0], log_scales[:, 1], log_scales[:, 2]
     # Our quats are (w,x,y,z) -- runner.py initializes identity as quats[:,0]=1,

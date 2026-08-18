@@ -1,10 +1,12 @@
 import unittest
+from argparse import Namespace
 
 import numpy as np
 
 from experiments.run_full_room_gaussians import (
     _cross_view_pair_score,
     cross_view_diagnostics,
+    resolve_profile,
 )
 
 
@@ -34,6 +36,27 @@ class CrossViewDiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(result["weak_views"], [0, 1])
         self.assertLess(result["median_pair_inlier_ratio"], 0.01)
+
+
+class TrainingProfileTests(unittest.TestCase):
+    def test_photoreal_profile_enables_high_detail_training(self):
+        config = resolve_profile(
+            "photoreal",
+            Namespace(iterations=None, target_long_edge=None, max_initial_points=None),
+        )
+        self.assertEqual(config["target_long_edge"], 1440)
+        self.assertEqual(config["max_initial_points"], 400_000)
+        self.assertEqual(config["sh_degree"], 2)
+        self.assertGreater(config["densify_until"], 2400)
+
+    def test_cli_values_override_profile(self):
+        config = resolve_profile(
+            "photoreal",
+            Namespace(iterations=12, target_long_edge=800, max_initial_points=123),
+        )
+        self.assertEqual(config["iterations"], 12)
+        self.assertEqual(config["target_long_edge"], 800)
+        self.assertEqual(config["max_initial_points"], 123)
 
 
 if __name__ == "__main__":

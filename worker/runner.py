@@ -141,7 +141,12 @@ def run_colmap_sfm(job: JobPayload, workdir: Path) -> ReconstructedScene:
     return colmap_reconstruction_to_scene(reconstructions[best_id], images_dir)
 
 
-def _init_gaussians_from_points(xyz: np.ndarray, rgb: np.ndarray, device: torch.device):
+def _init_gaussians_from_points(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    device: torch.device,
+    sh_degree: int | None = None,
+):
     """Seed Gaussians from a sparse/dense 3D point cloud (from COLMAP or DUSt3R --
     this function doesn't care which): position/color come straight from the
     points, scale from each point's distance to its nearest neighbor, rotation
@@ -166,7 +171,17 @@ def _init_gaussians_from_points(xyz: np.ndarray, rgb: np.ndarray, device: torch.
     quats[:, 0] = 1.0
     quats = quats.clone().requires_grad_(True)
     opacities = torch.full((n,), -2.0, device=device).requires_grad_(True)  # sigmoid(-2) ~= 0.12
-    colors = torch.tensor(rgb, device=device).requires_grad_(True)
+    colors = torch.tensor(rgb, device=device)
+    if sh_degree is not None:
+        coefficient_count = (sh_degree + 1) ** 2
+        coefficients = torch.zeros(
+            (n, coefficient_count, 3), dtype=colors.dtype, device=device
+        )
+        # Preserve the input RGB exactly at initialization. Higher coefficients
+        # begin at zero and learn view-dependent appearance during training.
+        coefficients[:, 0, :] = (colors - 0.5) / SH_C0
+        colors = coefficients
+    colors = colors.requires_grad_(True)
 
     # Same bound used at init, reused during training to stop gradient descent from
     # growing a few Gaussians huge again later (see train_gaussian_splatting).
@@ -326,15 +341,21 @@ def _params_from_exported_gaussians(
     opacity_logits = np.log(opacities / (1 - opacities))
     colors = torch.tensor(gaussians["colors"], device=device)
     if sh_degree is not None:
-        coefficient_count = (sh_degree + 1) ** 2
-        sh_coefficients = torch.zeros(
-            (len(colors), coefficient_count, 3), dtype=colors.dtype, device=device
-        )
-        # gsplat evaluates SH color as 0.5 + C0 * dc + directional terms.
-        # This inverse makes the new SH scene render exactly like the existing
-        # fixed-RGB scene before any directional coefficient is optimized.
-        sh_coefficients[:, 0, :] = (colors - 0.5) / SH_C0
-        colors = sh_coefficients
+        if "sh_coeffs" in gaussians:
+            colors = torch.tensor(gaussians["sh_coeffs"], device=device)
+            expected = (sh_degree + 1) ** 2
+            if colors.shape[1] != expected:
+                raise ValueError(
+                    f"Export contains {colors.shape[1]} SH coefficients, expected {expected}"
+                )
+        else:
+            coefficient_count = (sh_degree + 1) ** 2
+            sh_coefficients = torch.zeros(
+                (len(colors), coefficient_count, 3), dtype=colors.dtype, device=device
+            )
+            # gsplat evaluates SH color as 0.5 + C0 * dc + directional terms.
+            sh_coefficients[:, 0, :] = (colors - 0.5) / SH_C0
+            colors = sh_coefficients
     return torch.nn.ParameterDict(
         {
             "means": torch.nn.Parameter(torch.tensor(gaussians["means"], device=device)),
@@ -436,7 +457,7 @@ def train_gaussian_splatting(
         start_step = step_offset
         if initial_gaussians is None:
             means, quats, scales, opacities, colors, _max_log_scale = _init_gaussians_from_points(
-                scene.points_xyz, scene.points_rgb, device
+                scene.points_xyz, scene.points_rgb, device, sh_degree
             )
             params = torch.nn.ParameterDict(
                 {
