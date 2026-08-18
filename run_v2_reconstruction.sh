@@ -25,6 +25,18 @@ else
   echo "already installed, skipping"
 fi
 
+echo "=== [1.5/4] Install COLMAP CLI + ffmpeg if missing ==="
+# Real failure hit on the second run: ns-process-data needs the standalone
+# `colmap` command, which nerfstudio does NOT install alongside itself
+# (confirmed by nerfstudio's own docs -- "COLMAP install issues are common").
+# ffmpeg checked defensively too, to avoid a third failure cycle for the
+# same reason -- most RunPod PyTorch images have it, but not guaranteed.
+if ! command -v colmap >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
+  apt-get update -qq && apt-get install -y -qq colmap ffmpeg
+else
+  echo "already installed, skipping"
+fi
+
 echo "=== [2/4] Frame extraction + COLMAP (feature matching, incremental SfM) ==="
 if [ ! -f "$OUT/data/colmap/sparse/0/cameras.bin" ]; then
   ns-process-data video --data "$VIDEO" --output-dir "$OUT/data"
