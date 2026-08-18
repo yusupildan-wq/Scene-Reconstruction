@@ -41,6 +41,16 @@ from gsplat import rasterization
 from PIL import Image
 from scipy.spatial import cKDTree
 from gsplat.strategy import DefaultStrategy
+try:
+    from training_schedule import (
+        camera_cycle_densification_schedule as _camera_cycle_densification_schedule,
+        camera_order_for_cycle as _camera_order_for_cycle,
+    )
+except ImportError:  # Package-style imports used by local tests/tooling.
+    from worker.training_schedule import (
+        camera_cycle_densification_schedule as _camera_cycle_densification_schedule,
+        camera_order_for_cycle as _camera_order_for_cycle,
+    )
 
 SH_C0 = 0.28209479177387814
 
@@ -89,6 +99,8 @@ class GaussianTrainingState:
     sh_degree: int | None = None
     camera_pose_deltas: torch.nn.Parameter | None = None
     camera_pose_optimizer: torch.optim.Optimizer | None = None
+    camera_sampling: str = "sequential"
+    camera_sampling_seed: int = 0
 
 
 def colmap_reconstruction_to_scene(recon: pycolmap.Reconstruction, images_dir: Path) -> ReconstructedScene:
@@ -412,6 +424,9 @@ def train_gaussian_splatting(
     camera_pose_learning_rate: float = 1e-5,
     camera_rotation_regularization: float = 1e-3,
     camera_translation_regularization: float = 1e-3,
+    camera_sampling: str = "sequential",
+    camera_sampling_seed: int = 0,
+    densify_interval_camera_cycles: int | None = None,
 ) -> dict | tuple[dict, GaussianTrainingState]:
     """Per-scene optimization: differentiable rasterization + photometric loss,
     refining the SfM-initialized Gaussians against the real extracted frames,
@@ -433,6 +448,17 @@ def train_gaussian_splatting(
     UNVALIDATED UNTIL A REAL COLAB GPU RUN.
     """
     device = torch.device("cuda")
+    camera_count = len(scene.camera_images)
+    if camera_count == 0:
+        raise RuntimeError("No registered cameras with poses to train against")
+    if camera_sampling not in {"sequential", "shuffled_cycle"}:
+        raise ValueError(
+            "camera_sampling must be 'sequential' or 'shuffled_cycle'"
+        )
+    if densify_interval_camera_cycles is not None:
+        _, densify_interval = _camera_cycle_densification_schedule(
+            camera_count, densify_from, step_offset, densify_interval_camera_cycles
+        )
     if training_state is not None and initial_gaussians is not None:
         raise ValueError("Pass training_state or initial_gaussians, not both")
 
@@ -453,6 +479,13 @@ def train_gaussian_splatting(
             )
         camera_pose_deltas = training_state.camera_pose_deltas
         camera_pose_optimizer = training_state.camera_pose_optimizer
+        if (
+            camera_sampling != training_state.camera_sampling
+            or camera_sampling_seed != training_state.camera_sampling_seed
+        ):
+            raise ValueError(
+                "Requested camera sampling configuration does not match saved state"
+            )
     else:
         start_step = step_offset
         if initial_gaussians is None:
@@ -477,6 +510,20 @@ def train_gaussian_splatting(
         # A warm start has no saved screen-gradient history. Give it 500 steps
         # to accumulate representative statistics before its first refinement.
         effective_densify_from = max(densify_from, start_step + 500)
+        if densify_interval_camera_cycles is not None:
+            # DefaultStrategy refines on global ``refine_every`` boundaries.
+            # Aligning its start and making the interval a whole number of
+            # camera cycles ensures every refinement window contains every
+            # camera equally often. The default step-based behavior is kept
+            # exactly when this opt-in setting is absent.
+            effective_densify_from, densify_interval = (
+                _camera_cycle_densification_schedule(
+                    camera_count,
+                    densify_from,
+                    start_step,
+                    densify_interval_camera_cycles,
+                )
+            )
         strategy = DefaultStrategy(
             refine_start_iter=effective_densify_from,
             refine_stop_iter=densify_until,
@@ -506,6 +553,16 @@ def train_gaussian_splatting(
 
     if not cameras:
         raise RuntimeError("No registered cameras with poses to train against")
+
+    if (
+        training_state is not None
+        and densify_interval_camera_cycles is not None
+        and strategy.refine_every != densify_interval
+    ):
+        raise ValueError(
+            "Saved densification interval does not match requested camera-cycle "
+            f"schedule ({strategy.refine_every} != {densify_interval})"
+        )
 
     if optimize_camera_exposure and exposure_optimizer is None:
         # log-gain keeps the multiplicative correction positive. Gain=1 and
@@ -538,6 +595,8 @@ def train_gaussian_splatting(
     ):
         raise ValueError("Saved camera-pose state does not match the scene camera count")
 
+    sampling_cycle = None
+    sampling_order = None
     for step in range(start_step, stop_step):
         if (
             learning_rate_decay_step is not None
@@ -550,7 +609,19 @@ def train_gaussian_splatting(
                 f"Step {step}: reduced all learning rates by "
                 f"{learning_rate_decay_factor:g} for late-stage refinement."
             )
-        camera_index = step % len(cameras)
+        if camera_sampling == "sequential":
+            camera_index = step % len(cameras)
+        else:
+            cycle = step // len(cameras)
+            if cycle != sampling_cycle:
+                # Deriving each permutation solely from its global cycle makes
+                # resumed runs select exactly the same cameras as uninterrupted
+                # runs without adding sampler state to checkpoints.
+                sampling_order = _camera_order_for_cycle(
+                    len(cameras), cycle, camera_sampling, camera_sampling_seed
+                )
+                sampling_cycle = cycle
+            camera_index = int(sampling_order[step % len(cameras)])
         cam = cameras[camera_index]
         for optimizer in optimizers.values():
             optimizer.zero_grad(set_to_none=True)
@@ -636,18 +707,20 @@ def train_gaussian_splatting(
     if not return_training_state:
         return gaussians
     state = GaussianTrainingState(
-        params,
-        optimizers,
-        strategy,
-        strategy_state,
-        stop_step,
-        learning_rate_decay_applied,
-        exposure_log_gains,
-        exposure_biases,
-        exposure_optimizer,
-        sh_degree,
-        camera_pose_deltas,
-        camera_pose_optimizer,
+        params=params,
+        optimizers=optimizers,
+        strategy=strategy,
+        strategy_state=strategy_state,
+        step=stop_step,
+        learning_rate_decay_applied=learning_rate_decay_applied,
+        exposure_log_gains=exposure_log_gains,
+        exposure_biases=exposure_biases,
+        exposure_optimizer=exposure_optimizer,
+        sh_degree=sh_degree,
+        camera_pose_deltas=camera_pose_deltas,
+        camera_pose_optimizer=camera_pose_optimizer,
+        camera_sampling=camera_sampling,
+        camera_sampling_seed=camera_sampling_seed,
     )
     return gaussians, state
 
@@ -708,6 +781,8 @@ def save_training_state(state: GaussianTrainingState, path: Path) -> None:
             "camera_pose_optimizer": (
                 state.camera_pose_optimizer.state_dict() if state.camera_pose_optimizer is not None else None
             ),
+            "camera_sampling": state.camera_sampling,
+            "camera_sampling_seed": state.camera_sampling_seed,
         },
         path,
     )
@@ -768,6 +843,8 @@ def load_training_state(path: Path, device: torch.device) -> GaussianTrainingSta
         sh_degree=checkpoint["sh_degree"],
         camera_pose_deltas=camera_pose_deltas,
         camera_pose_optimizer=camera_pose_optimizer,
+        camera_sampling=checkpoint.get("camera_sampling", "sequential"),
+        camera_sampling_seed=checkpoint.get("camera_sampling_seed", 0),
     )
 
 
