@@ -45,6 +45,20 @@ else
   echo "already installed, skipping"
 fi
 
+echo "=== [1.25/4] Patch nerfstudio for PyTorch 2.6 torch.load default change ==="
+# PyTorch 2.6 flipped torch.load's weights_only default from False to True.
+# nerfstudio's pip release predates that change and calls torch.load without
+# the flag, so checkpoint loading (ns-export, ns-render, --load-dir resume)
+# fails with `_pickle.UnpicklingError: Weights only load failed` on a numpy
+# global -- confirmed via a real failed export run, not guessed. We trust our
+# own checkpoints (this pipeline produced them), so it's safe to load with
+# weights_only=False. sed is idempotent: if already patched, the pattern
+# won't match and this is a no-op.
+EVAL_UTILS=$(python3 -c "import nerfstudio.utils.eval_utils as m; print(m.__file__)" 2>/dev/null || true)
+if [ -n "$EVAL_UTILS" ] && grep -q 'torch.load(load_path, map_location="cpu")' "$EVAL_UTILS"; then
+  sed -i 's/torch.load(load_path, map_location="cpu")/torch.load(load_path, map_location="cpu", weights_only=False)/' "$EVAL_UTILS"
+fi
+
 echo "=== [1.5/4] Install COLMAP CLI + ffmpeg if missing ==="
 # Real failure hit on the second run: ns-process-data needs the standalone
 # `colmap` command, which nerfstudio does NOT install alongside itself
