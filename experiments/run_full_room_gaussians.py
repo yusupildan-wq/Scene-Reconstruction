@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -67,6 +68,103 @@ def _reprojection_summary(points, masks, intrinsics, viewmats) -> dict[str, floa
     return {
         "median_pixels": float(np.median(merged)),
         "p95_pixels": float(np.percentile(merged, 95)),
+    }
+
+
+def _cross_view_pair_score(
+    source_points: np.ndarray,
+    source_mask: np.ndarray,
+    target_points: np.ndarray,
+    target_mask: np.ndarray,
+    target_K: np.ndarray,
+    target_viewmat: np.ndarray,
+    *,
+    relative_tolerance: float = 0.03,
+    sample_limit: int = 20_000,
+) -> dict[str, float]:
+    """Measure whether one view's 3D points agree with another view's surface.
+
+    Self-reprojection only verifies that a point map agrees with the camera that
+    produced it.  This projects source-view world points into a *different*
+    camera and compares them with that camera's independently predicted world
+    points.  The distance tolerance is relative to camera depth so it works at
+    different room scales.
+    """
+    source = source_points[source_mask]
+    if len(source) > sample_limit:
+        # Evenly spaced sampling is deterministic and covers the whole image,
+        # unlike a random sample that can accidentally overrepresent a wall.
+        source = source[np.linspace(0, len(source) - 1, sample_limit, dtype=int)]
+    homogeneous = np.concatenate(
+        (source, np.ones((len(source), 1), dtype=source.dtype)), axis=1
+    )
+    camera = (target_viewmat @ homogeneous.T).T[:, :3]
+    in_front = np.isfinite(camera).all(axis=1) & (camera[:, 2] > 1e-6)
+    camera = camera[in_front]
+    source = source[in_front]
+    projected = (target_K @ camera.T).T
+    xy = projected[:, :2] / projected[:, 2:3]
+    px = np.rint(xy[:, 0]).astype(np.int64)
+    py = np.rint(xy[:, 1]).astype(np.int64)
+    height, width = target_mask.shape
+    overlap = (
+        (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    )
+    px, py = px[overlap], py[overlap]
+    source = source[overlap]
+    depths = camera[overlap, 2]
+    target_valid = target_mask[py, px]
+    px, py = px[target_valid], py[target_valid]
+    source = source[target_valid]
+    depths = depths[target_valid]
+    if not len(source):
+        return {"overlap": 0.0, "median_relative_error": float("inf"), "inlier_ratio": 0.0}
+    distances = np.linalg.norm(source - target_points[py, px], axis=1)
+    relative_error = distances / np.maximum(np.abs(depths), 1e-6)
+    return {
+        "overlap": float(len(source) / max(int(source_mask.sum()), 1)),
+        "median_relative_error": float(np.median(relative_error)),
+        "inlier_ratio": float(np.mean(relative_error <= relative_tolerance)),
+    }
+
+
+def cross_view_diagnostics(points, masks, intrinsics, poses, radius: int = 2) -> dict:
+    """Score local camera pairs and identify views that disagree with neighbors."""
+    pair_metrics = []
+    per_view = [[] for _ in points]
+    viewmats = [np.linalg.inv(pose).astype(np.float32) for pose in poses]
+    for source_index in range(len(points)):
+        for target_index in range(source_index + 1, min(len(points), source_index + radius + 1)):
+            forward = _cross_view_pair_score(
+                points[source_index], masks[source_index],
+                points[target_index], masks[target_index], intrinsics[target_index],
+                viewmats[target_index],
+            )
+            backward = _cross_view_pair_score(
+                points[target_index], masks[target_index],
+                points[source_index], masks[source_index], intrinsics[source_index],
+                viewmats[source_index],
+            )
+            score = {
+                "source": source_index,
+                "target": target_index,
+                "overlap": float((forward["overlap"] + backward["overlap"]) / 2),
+                "median_relative_error": float((forward["median_relative_error"] + backward["median_relative_error"]) / 2),
+                "inlier_ratio": float((forward["inlier_ratio"] + backward["inlier_ratio"]) / 2),
+            }
+            pair_metrics.append(score)
+            per_view[source_index].append(score["inlier_ratio"])
+            per_view[target_index].append(score["inlier_ratio"])
+    view_scores = [float(np.median(values)) if values else 0.0 for values in per_view]
+    finite_errors = [item["median_relative_error"] for item in pair_metrics if np.isfinite(item["median_relative_error"])]
+    return {
+        "radius": radius,
+        "relative_tolerance": 0.03,
+        "median_pair_inlier_ratio": float(np.median([item["inlier_ratio"] for item in pair_metrics])),
+        "median_pair_relative_error": float(np.median(finite_errors)) if finite_errors else None,
+        "view_scores": view_scores,
+        "weak_views": [index for index, score in enumerate(view_scores) if score < 0.35],
+        "pairs": pair_metrics,
     }
 
 
@@ -156,7 +254,11 @@ def evaluate_latest(scene, run_dir: Path, views: int = 8) -> None:
     from gsplat import rasterization
     from runner import _ssim
 
-    exports = sorted(run_dir.glob("gaussians_step*.npz"))
+    def step_number(path: Path) -> int:
+        match = re.search(r"step(\d+)", path.stem)
+        return int(match.group(1)) if match else -1
+
+    exports = sorted(run_dir.glob("gaussians_step*.npz"), key=step_number)
     if not exports:
         raise RuntimeError(f"No Gaussian export found in {run_dir}")
     export = exports[-1]
@@ -211,6 +313,7 @@ def main() -> None:
     parser.add_argument("--max-initial-points", type=int, default=160_000)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--diagnose-cross-view", action="store_true")
     args = parser.parse_args()
 
     scene, report = load_scene(
@@ -221,6 +324,20 @@ def main() -> None:
     print(json.dumps(report, indent=2), flush=True)
     if args.validate_only:
         print(f"Validation complete: {report_path}")
+        return
+    if args.diagnose_cross_view:
+        geometry = args.run_dir / "geometry"
+        camera_data = np.load(geometry / "cameras.npz")
+        poses = camera_data["poses"].astype(np.float32)
+        intrinsics = camera_data["intrinsics"].astype(np.float32)
+        points = [np.load(geometry / f"points_{i:04d}.npy") for i in range(len(poses))]
+        masks = [np.load(geometry / f"mask_{i:04d}.npy").astype(bool) for i in range(len(poses))]
+        diagnostics = cross_view_diagnostics(points, masks, intrinsics, poses)
+        output = args.run_dir / "cross_view_diagnostics.json"
+        output.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+        summary = {key: value for key, value in diagnostics.items() if key != "pairs"}
+        print(json.dumps(summary, indent=2))
+        print(f"Cross-view diagnostics: {output}")
         return
     if args.evaluate_only:
         evaluate_latest(scene, args.run_dir)
