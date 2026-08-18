@@ -55,7 +55,17 @@ echo "=== [2/4] Frame extraction + COLMAP (feature matching, incremental SfM) ==
 # dependency at all, so it just works instead of needing to rig up a
 # virtual framebuffer for marginal speed gain.
 if [ ! -f "$OUT/data/colmap/sparse/0/cameras.bin" ]; then
-  ns-process-data video --data "$VIDEO" --output-dir "$OUT/data" --no-gpu
+  # Real failure hit on the fifth run: process got silently "Killed" (the
+  # OOM killer, confirmed: this container's real cgroup memory limit is
+  # ~125GB, not the 1TB the host reports) partway through feature
+  # extraction. Root cause: nerfstudio's run_colmap() has no thread-count
+  # flag at all, and COLMAP's SIFT extraction auto-detects thread count
+  # from nproc, which reported this HOST's 256 cores -- 256 parallel
+  # CPU-side SIFT workers on 1920x1080 frames blew past the container's
+  # actual budget. taskset restricts CPU affinity for the whole process
+  # tree; COLMAP's thread auto-detection respects that, so this caps
+  # parallelism (and peak memory) without needing to patch nerfstudio.
+  taskset -c 0-15 ns-process-data video --data "$VIDEO" --output-dir "$OUT/data" --no-gpu
 else
   echo "COLMAP output already present, skipping"
 fi
