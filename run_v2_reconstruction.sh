@@ -16,6 +16,18 @@ set -euo pipefail
 # Standard, well-known fix for exactly this error on headless Linux servers.
 export QT_QPA_PLATFORM=offscreen
 
+# Real failure hit on the seventh run: training crashed with
+# "AssertionError: duplicate template name" deep inside
+# torch._inductor.kernel.flex_attention, triggered by torch._dynamo.optimize
+# during splatfacto startup -- a torch.compile/Triton internal bug (a
+# module's kernel-template registration ran twice in the same process), not
+# something caused by this script's own flags. torch.compile is a
+# performance optimization, not required for correctness, so disabling it
+# entirely is the standard, well-known workaround for this class of
+# torch-inductor bug -- forces eager-mode execution instead.
+export TORCHDYNAMO_DISABLE=1
+export TORCH_COMPILE_DISABLE=1
+
 OUT=/workspace/v2-reconstruction
 VIDEO=/workspace/IMG_1705.mov
 mkdir -p "$OUT"
