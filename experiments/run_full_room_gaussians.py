@@ -23,6 +23,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "worker"))
 
 from experiments.convert_bin_to_ply import convert_npz
+from experiments.robust_fusion import (
+    RobustFusionConfig,
+    concatenation_fusion,
+    robust_consensus_fusion,
+)
 
 
 PROFILES = {
@@ -285,6 +290,8 @@ def load_scene(
     target_long_edge: int,
     max_initial_points: int,
     excluded_view_indices: list[int] | None = None,
+    fusion_mode: str = "concatenation",
+    fusion_config: RobustFusionConfig | None = None,
 ):
     from runner import ReconstructedScene
 
@@ -349,9 +356,20 @@ def load_scene(
         K[1, (1, 2)] *= sy
         scaled_Ks.append(K)
 
+    if fusion_mode == "concatenation":
+        fused_xyz, fused_rgb, fusion_stats = concatenation_fusion(
+            initial_xyz, initial_rgb
+        )
+    elif fusion_mode == "robust_consensus":
+        fused_xyz, fused_rgb, fusion_stats = robust_consensus_fusion(
+            initial_xyz, initial_rgb, fusion_config
+        )
+    else:
+        raise ValueError(f"Unknown fusion mode: {fusion_mode}")
+
     scene = ReconstructedScene(
-        points_xyz=np.concatenate(initial_xyz).astype(np.float32),
-        points_rgb=np.concatenate(initial_rgb).astype(np.float32),
+        points_xyz=fused_xyz,
+        points_rgb=fused_rgb,
         camera_viewmats=viewmats,
         camera_Ks=scaled_Ks,
         camera_images=camera_images,
@@ -364,6 +382,7 @@ def load_scene(
         "valid_points_median": float(np.median(counts)),
         "valid_points_max": int(counts.max()),
         "initial_points": int(len(scene.points_xyz)),
+        "fusion": fusion_stats,
         "target_size": list(camera_images[0].shape[:2]),
         "reprojection": reprojection,
     }
@@ -436,6 +455,17 @@ def main() -> None:
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--target-long-edge", type=int)
     parser.add_argument("--max-initial-points", type=int)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("concatenation", "robust_consensus"),
+        default="concatenation",
+    )
+    parser.add_argument("--fusion-voxel-size", type=float, default=0.01)
+    parser.add_argument("--fusion-min-view-support", type=int, default=2)
+    parser.add_argument(
+        "--fusion-max-position-disagreement", type=float, default=0.02
+    )
+    parser.add_argument("--fusion-mad-multiplier", type=float, default=3.0)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--diagnose-cross-view", action="store_true")
@@ -459,6 +489,13 @@ def main() -> None:
         config["target_long_edge"],
         config["max_initial_points"],
         excluded,
+        args.fusion_mode,
+        RobustFusionConfig(
+            voxel_size=args.fusion_voxel_size,
+            min_view_support=args.fusion_min_view_support,
+            max_position_disagreement=args.fusion_max_position_disagreement,
+            mad_multiplier=args.fusion_mad_multiplier,
+        ),
     )
     report["profile"] = args.profile
     report_path = output_dir / "geometry_validation.json"
