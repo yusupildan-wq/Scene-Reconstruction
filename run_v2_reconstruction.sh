@@ -46,8 +46,16 @@ else
 fi
 
 echo "=== [2/4] Frame extraction + COLMAP (feature matching, incremental SfM) ==="
+# Real failure hit on the fourth run: COLMAP's GPU-accelerated SIFT uses
+# OpenGL (not just CUDA) for the GPU context, which needs a real or virtual
+# display -- this pod is fully headless (confirmed: "Check failed:
+# context_.create()" in opengl_utils.cc). --no-gpu (verified real field,
+# colmap_converter_to_nerfstudio_dataset.py's `gpu: bool = True`) falls back
+# to CPU-based SIFT extraction/matching -- slower, but has no display
+# dependency at all, so it just works instead of needing to rig up a
+# virtual framebuffer for marginal speed gain.
 if [ ! -f "$OUT/data/colmap/sparse/0/cameras.bin" ]; then
-  ns-process-data video --data "$VIDEO" --output-dir "$OUT/data"
+  ns-process-data video --data "$VIDEO" --output-dir "$OUT/data" --no-gpu
 else
   echo "COLMAP output already present, skipping"
 fi
