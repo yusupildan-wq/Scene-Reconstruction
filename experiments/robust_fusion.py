@@ -118,7 +118,8 @@ def robust_consensus_fusion(
     supports: list[int] = []
     accepted_raw_observations = 0
     rejected_raw_observations = invalid_count
-    disagreements: list[float] = []
+    candidate_disagreements: list[float] = []
+    accepted_consensus_residuals: list[float] = []
     index = 0
     while index < len(entries):
         end = index + 1
@@ -129,6 +130,7 @@ def robust_consensus_fusion(
         colors = np.stack([item[3] for item in group])
         center = np.median(positions, axis=0)
         distances = np.linalg.norm(positions - center, axis=1)
+        candidate_disagreements.extend(float(value) for value in distances)
         distance_median = float(np.median(distances))
         mad = float(np.median(np.abs(distances - distance_median)))
         robust_limit = distance_median + config.mad_multiplier * max(mad, 1e-12)
@@ -141,7 +143,7 @@ def robust_consensus_fusion(
             fused_points.append(consensus)
             fused_colors.append(np.median(colors[accepted], axis=0))
             supports.append(support)
-            disagreements.extend(float(value) for value in residuals)
+            accepted_consensus_residuals.extend(float(value) for value in residuals)
             accepted_raw_observations += sum(
                 item[4] for item, keep in zip(group, accepted) if keep
             )
@@ -161,7 +163,8 @@ def robust_consensus_fusion(
     fused_xyz = np.asarray(fused_points, dtype=np.float32)
     fused_rgb = np.clip(np.asarray(fused_colors, dtype=np.float32), 0.0, 1.0)
     support_values = np.asarray(supports, dtype=np.float64)
-    disagreement_values = np.asarray(disagreements, dtype=np.float64)
+    candidate_values = np.asarray(candidate_disagreements, dtype=np.float64)
+    accepted_values = np.asarray(accepted_consensus_residuals, dtype=np.float64)
     # Input observations consolidated within a view are duplicate-suppressed,
     # while cross-view representatives that fail consensus are rejected.
     duplicate_suppressed = accepted_raw_observations - len(fused_xyz)
@@ -180,10 +183,11 @@ def robust_consensus_fusion(
         "duplicate_observations_suppressed": int(duplicate_suppressed),
         "supported_voxels": int(len(fused_xyz)),
         "support_distribution": _distribution(support_values),
-        "estimated_surface_thickness_before": _distribution(disagreement_values),
+        "estimated_surface_thickness_before": _distribution(candidate_values),
         "estimated_surface_thickness_after": {"median": 0.0, "p95": 0.0},
-        "spatial_disagreement_before": _distribution(disagreement_values),
+        "spatial_disagreement_before": _distribution(candidate_values),
         "spatial_disagreement_after": {"median": 0.0, "p95": 0.0},
+        "accepted_consensus_residuals": _distribution(accepted_values),
     }
     return fused_xyz, fused_rgb, stats
 

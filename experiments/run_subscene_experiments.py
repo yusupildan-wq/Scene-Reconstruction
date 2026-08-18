@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -49,6 +49,7 @@ class ExperimentConfig:
     target_long_edge: int = 1440
     evaluation_views: tuple[int, ...] = DEFAULT_EVALUATION_VIEWS
     fusion_mode: str = "concatenation"
+    training_mode: str = "baseline"
     sh_degree: int | None = 2
 
 
@@ -95,16 +96,24 @@ def _json_write(path: Path, data: dict) -> None:
 def _sample_observations(
     points_by_view: Sequence[np.ndarray],
     colors_by_view: Sequence[np.ndarray],
+    original_view_indices: Sequence[int],
     points_per_camera: int,
     seed: int,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    if len(points_by_view) != len(original_view_indices):
+        raise ValueError("original view identities must match observation arrays")
     sampled_points, sampled_colors = [], []
-    for view_offset, (points, colors) in enumerate(zip(points_by_view, colors_by_view)):
+    for original_index, points, colors in zip(
+        original_view_indices, points_by_view, colors_by_view
+    ):
         if len(points) != len(colors):
             raise ValueError("point/color observation counts differ")
         if not len(points):
             raise ValueError("a selected view has no valid observations")
-        rng = np.random.default_rng(np.random.SeedSequence([seed, view_offset]))
+        # Seed by persistent geometry identity, not subset-local position.  The
+        # same camera therefore contributes exactly the same samples in every
+        # nested 1/4/8/16-view treatment.
+        rng = np.random.default_rng(np.random.SeedSequence([seed, int(original_index)]))
         if len(points) > points_per_camera:
             chosen = rng.choice(len(points), points_per_camera, replace=False)
             points, colors = points[chosen], colors[chosen]
@@ -121,28 +130,54 @@ def fuse_sampled_observations(
     robust_config=None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Clean integration boundary shared with ``experiments.robust_fusion``."""
-    input_count = int(sum(len(points) for points in points_by_view))
+    from experiments.robust_fusion import (
+        concatenation_fusion,
+        robust_consensus_fusion,
+    )
+
     if mode == "concatenation":
-        xyz = np.concatenate(points_by_view).astype(np.float32)
-        rgb = np.concatenate(colors_by_view).astype(np.float32)
-        return xyz, rgb, {
-            "mode": mode,
-            "input_observations": input_count,
-            "output_points": int(len(xyz)),
-            "rejected_observations": 0,
-        }
+        return concatenation_fusion(points_by_view, colors_by_view)
     if mode == "robust_consensus":
-        try:
-            from experiments.robust_fusion import robust_consensus_fusion
-        except ImportError as exc:
-            raise RuntimeError(
-                "robust_consensus requires experiments.robust_fusion to be integrated"
-            ) from exc
         xyz, rgb, stats = robust_consensus_fusion(
             points_by_view, colors_by_view, config=robust_config
         )
         return np.asarray(xyz, dtype=np.float32), np.asarray(rgb, dtype=np.float32), stats
     raise ValueError(f"unsupported fusion mode: {mode}")
+
+
+def conflict_training_options(
+    mode: str, camera_count: int, seed: int
+) -> dict[str, int | str]:
+    """Resolve the trainer treatment without changing baseline defaults.
+
+    The conflict-aware cadence is the smallest whole-camera-cycle interval at
+    least as long as the historical 100-step refinement window.  This makes
+    every window contain every camera while keeping cadence comparable across
+    the 1/4/8/16-view treatments.
+    """
+    if mode == "baseline":
+        return {}
+    if mode != "conflict_aware":
+        raise ValueError(f"unsupported training mode: {mode}")
+    if camera_count < 1:
+        raise ValueError("camera_count must be positive")
+    cycles = math.ceil(100 / camera_count)
+    return {
+        "camera_sampling": "shuffled_cycle",
+        "camera_sampling_seed": seed,
+        "densify_interval_camera_cycles": cycles,
+    }
+
+
+def resolve_robust_config(config, camera_count: int):
+    """Make the one-view fusion treatment runnable without weakening others."""
+    if config is None:
+        return None
+    if camera_count < 1:
+        raise ValueError("camera_count must be positive")
+    if config.min_view_support <= camera_count:
+        return config
+    return replace(config, min_view_support=camera_count)
 
 
 def _pair_geometry_metrics(
@@ -249,6 +284,7 @@ def load_subscene(run_dir: Path, original_indices: Sequence[int], config: Experi
     sampled_points, sampled_colors = _sample_observations(
         [point[mask] for point, mask in zip(points, masks)],
         [image[mask] for image, mask in zip(low_images, masks)],
+        indices,
         config.points_per_camera, config.seed,
     )
     xyz, rgb, fusion_stats = fuse_sampled_observations(
@@ -328,10 +364,11 @@ def evaluate_experiment(scene, original_indices, evaluation_views, output_dir, s
                 torch.tensor(scene.camera_Ks[local_index], device="cuda").unsqueeze(0),
                 width, height, sh_degree=state.sh_degree,
             )
-            canonical = render[0].clamp(0, 1)
+            raw_render = render[0]
+            canonical = raw_render.clamp(0, 1)
             adjusted = canonical
             if state.exposure_log_gains is not None and state.exposure_biases is not None:
-                adjusted = (canonical * torch.exp(state.exposure_log_gains[local_index])
+                adjusted = (raw_render * torch.exp(state.exposure_log_gains[local_index])
                             + state.exposure_biases[local_index]).clamp(0, 1)
             target_np, canonical_np, adjusted_np = (item.detach().cpu().numpy()
                                                      for item in (target, canonical, adjusted))
@@ -371,15 +408,30 @@ def run_one(run_dir, output_dir, original_indices, config, robust_config=None) -
     from runner import load_training_state, save_training_state, train_gaussian_splatting
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    effective_robust_config = robust_config
+    if config.fusion_mode == "robust_consensus":
+        # The one-view treatment cannot demonstrate cross-view support, but it
+        # must remain runnable to reveal whether within-view voxel consolidation
+        # alone changes quality. Larger subsets retain the requested threshold.
+        effective_robust_config = resolve_robust_config(
+            robust_config, len(original_indices)
+        )
+    trainer_options = conflict_training_options(
+        config.training_mode, len(original_indices), config.seed
+    )
     manifest = {**asdict(config), "evaluation_views": list(config.evaluation_views),
                 "original_view_indices": list(original_indices),
-                "target_iterations": config.updates_per_camera * len(original_indices)}
-    if robust_config is not None:
-        manifest["robust_fusion_config"] = asdict(robust_config)
+                "evaluation_protocol": "exact_training_camera",
+                "target_iterations": config.updates_per_camera * len(original_indices),
+                "resolved_trainer_options": trainer_options}
+    if effective_robust_config is not None:
+        manifest["robust_fusion_config"] = asdict(effective_robust_config)
     manifest_path = output_dir / "experiment_manifest.json"
     _assert_resume_compatible(manifest_path, manifest)
     _json_write(manifest_path, manifest)
-    scene, geometry_report = load_subscene(run_dir, original_indices, config, robust_config)
+    scene, geometry_report = load_subscene(
+        run_dir, original_indices, config, effective_robust_config
+    )
     _json_write(output_dir / "pretraining_geometry.json", geometry_report)
     if not torch.cuda.is_available():
         raise RuntimeError("Gaussian experiment requires CUDA; setup reports were written, no training started")
@@ -395,6 +447,7 @@ def run_one(run_dir, output_dir, original_indices, config, robust_config=None) -
             scene, num_iterations=remaining, training_state=state,
             optimize_camera_exposure=True, optimize_camera_poses=False,
             sh_degree=config.sh_degree, return_training_state=True,
+            **trainer_options,
         )
         save_training_state(state, checkpoint)
         export = output_dir / f"gaussians_step{state.step}.npz"
@@ -413,6 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--fusion-mode", choices=("concatenation", "robust_consensus"), default="concatenation")
+    parser.add_argument("--training-mode", choices=("baseline", "conflict_aware"), default="baseline")
     parser.add_argument("--subset-counts", type=parse_index_list, default=(1, 4, 8, 16))
     parser.add_argument("--region-views", type=parse_index_list, default=tuple(range(46, 62)))
     parser.add_argument("--evaluation-views", type=parse_index_list, default=DEFAULT_EVALUATION_VIEWS)
@@ -453,17 +507,34 @@ def main() -> None:
         }
         robust_config = RobustFusionConfig(**{key: value for key, value in provided.items() if value is not None})
     config = ExperimentConfig(
-        args.updates_per_camera, args.points_per_camera, args.seed,
-        args.target_long_edge, tuple(args.evaluation_views), args.fusion_mode, args.sh_degree,
+        updates_per_camera=args.updates_per_camera,
+        points_per_camera=args.points_per_camera,
+        seed=args.seed,
+        target_long_edge=args.target_long_edge,
+        evaluation_views=tuple(args.evaluation_views),
+        fusion_mode=args.fusion_mode,
+        training_mode=args.training_mode,
+        sh_degree=args.sh_degree,
     )
     experiment_summary = {"config": asdict(config), "subsets": []}
     for count, views in subsets.items():
-        destination = args.output_dir / args.fusion_mode / f"views_{count:03d}"
+        destination = (
+            args.output_dir
+            / args.fusion_mode
+            / args.training_mode
+            / f"views_{count:03d}"
+        )
         result = run_one(args.run_dir, destination, views, config, robust_config)
         experiment_summary["subsets"].append({"view_count": count, "views": list(views),
                                                "result": str(destination / "result.json"),
                                                "metrics": result["evaluation"]["mean"]})
-        _json_write(args.output_dir / args.fusion_mode / "experiment_summary.json", experiment_summary)
+        _json_write(
+            args.output_dir
+            / args.fusion_mode
+            / args.training_mode
+            / "experiment_summary.json",
+            experiment_summary,
+        )
 
 
 if __name__ == "__main__":

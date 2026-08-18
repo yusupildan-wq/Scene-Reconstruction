@@ -7,6 +7,7 @@ import numpy as np
 
 from experiments.run_subscene_experiments import (
     _assert_resume_compatible,
+    conflict_training_options,
     _json_write,
     _pair_geometry_metrics,
     _sample_observations,
@@ -14,7 +15,10 @@ from experiments.run_subscene_experiments import (
     image_metrics,
     nested_subsets,
     parse_index_list,
+    resolve_robust_config,
+    build_parser,
 )
+from experiments.robust_fusion import RobustFusionConfig
 
 
 class SubsetTests(unittest.TestCase):
@@ -29,16 +33,31 @@ class SubsetTests(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_index_list("1,1,2")
 
+    def test_cli_defaults_preserve_baseline_treatment(self):
+        args = build_parser().parse_args(["run", "--output-dir", "out"])
+        self.assertEqual(args.fusion_mode, "concatenation")
+        self.assertEqual(args.training_mode, "baseline")
+        self.assertEqual(args.subset_counts, (1, 4, 8, 16))
+
 
 class SamplingAndFusionTests(unittest.TestCase):
     def test_sampling_is_fixed_per_camera_and_reproducible(self):
         points = [np.arange(90, dtype=np.float32).reshape(30, 3)] * 2
         colors = [item / 90 for item in points]
-        first, _ = _sample_observations(points, colors, 7, 42)
-        second, _ = _sample_observations(points, colors, 7, 42)
+        first, _ = _sample_observations(points, colors, [54, 55], 7, 42)
+        second, _ = _sample_observations(points, colors, [54, 55], 7, 42)
         self.assertEqual([len(item) for item in first], [7, 7])
         np.testing.assert_array_equal(first[0], second[0])
         self.assertFalse(np.array_equal(first[0], first[1]))
+
+    def test_same_original_camera_is_identical_across_nested_subsets(self):
+        camera = np.arange(180, dtype=np.float32).reshape(60, 3)
+        other = camera + 1000
+        one, _ = _sample_observations([camera], [camera], [54], 11, 42)
+        nested, _ = _sample_observations(
+            [other, camera], [other, camera], [53, 54], 11, 42
+        )
+        np.testing.assert_array_equal(one[0], nested[1])
 
     def test_concatenation_preserves_every_sample(self):
         points = [np.zeros((2, 3), np.float32), np.ones((3, 3), np.float32)]
@@ -47,6 +66,26 @@ class SamplingAndFusionTests(unittest.TestCase):
         self.assertEqual(len(xyz), 5)
         np.testing.assert_array_equal(xyz, rgb)
         self.assertEqual(stats["rejected_observations"], 0)
+
+    def test_baseline_training_keeps_historical_defaults(self):
+        self.assertEqual(conflict_training_options("baseline", 16, 7), {})
+
+    def test_conflict_training_uses_balanced_comparable_cycles(self):
+        one = conflict_training_options("conflict_aware", 1, 7)
+        four = conflict_training_options("conflict_aware", 4, 7)
+        eight = conflict_training_options("conflict_aware", 8, 7)
+        sixteen = conflict_training_options("conflict_aware", 16, 7)
+        self.assertEqual(one["densify_interval_camera_cycles"], 100)
+        self.assertEqual(four["densify_interval_camera_cycles"], 25)
+        self.assertEqual(eight["densify_interval_camera_cycles"], 13)
+        self.assertEqual(sixteen["densify_interval_camera_cycles"], 7)
+        self.assertEqual(four["camera_sampling"], "shuffled_cycle")
+        self.assertEqual(four["camera_sampling_seed"], 7)
+
+    def test_one_view_robust_fusion_resolves_support_without_weakening_larger_sets(self):
+        requested = RobustFusionConfig(min_view_support=2)
+        self.assertEqual(resolve_robust_config(requested, 1).min_view_support, 1)
+        self.assertIs(resolve_robust_config(requested, 4), requested)
 
 
 class GeometryAndMetricTests(unittest.TestCase):

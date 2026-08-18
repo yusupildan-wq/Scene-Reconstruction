@@ -68,6 +68,10 @@ class RobustFusionTests(unittest.TestCase):
         self.assertLess(float(xyz[0, 0]), 0.01)
         np.testing.assert_allclose(rgb[0], [0.21, 0.41, 0.61], atol=1e-6)
         self.assertEqual(stats["rejected_observations"], 1)
+        self.assertGreater(
+            stats["spatial_disagreement_before"]["max"],
+            stats["accepted_consensus_residuals"]["max"],
+        )
         self.assertEqual(
             stats["input_observations"],
             stats["rejected_observations"]
