@@ -65,7 +65,15 @@ if [ ! -f "$OUT/data/colmap/sparse/0/cameras.bin" ]; then
   # actual budget. taskset restricts CPU affinity for the whole process
   # tree; COLMAP's thread auto-detection respects that, so this caps
   # parallelism (and peak memory) without needing to patch nerfstudio.
-  taskset -c 0-15 ns-process-data video --data "$VIDEO" --output-dir "$OUT/data" --no-gpu
+  # Sixth run: taskset alone got much further (129/313 files vs. 8/313
+  # before) but still eventually got OOM-killed -- roughly proportional to
+  # the thread-count reduction, suggesting memory pressure scales with
+  # total images processed, not just instantaneous parallelism (root cause
+  # inside COLMAP's own feature extractor, not something nerfstudio or this
+  # script controls directly). Rather than keep chasing the exact mechanism,
+  # applying two independent safety margins: fewer total frames
+  # (num_frames_target, real default 300) and a tighter CPU cap.
+  taskset -c 0-7 ns-process-data video --data "$VIDEO" --output-dir "$OUT/data" --no-gpu --num-frames-target 150
 else
   echo "COLMAP output already present, skipping"
 fi
