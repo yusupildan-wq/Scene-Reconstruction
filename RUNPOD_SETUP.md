@@ -64,6 +64,12 @@ Valid VGGT geometry and completed PLY exports are reused automatically. Never
 use `--force-geometry` or `--force-training` without evidence that the existing
 artifact is invalid.
 
+For the high-quality A/B pass, preserve the existing 7k result and use a new
+output directory with `--stage train --quality-profile high`. This means full
+resolution, 30k steps, pose refinement, and antialiased rasterization. Budget
+approximately the official 30k single-GPU training class (tens of minutes), then
+stop the pod immediately after verification and artifact export.
+
 ## 4. Completion and shutdown
 
 Verify the job exit file contains `0`, the run manifest says `complete`, and

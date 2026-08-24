@@ -1,87 +1,125 @@
-"""Runs a job's pipeline stages in the background after the upload request returns.
-
-This is the async job pattern the project is built around: the HTTP request that
-uploads a video must not block for however long reconstruction takes (minutes to
-tens of minutes), so it does the minimum work to persist the input and create a Job
-row, then returns immediately. Everything after that happens out-of-band and is
-observed by the frontend polling GET /jobs/{id}, not by the original request.
-
-In V0, FastAPI's BackgroundTasks stands in for what would become a real queue+worker
-(RunPod's serverless queue, once dispatch.py is implemented) -- it runs in the same
-process after the response is sent, which is fine for the CPU-only stage but is not
-how the GPU stage will work once it's real.
-"""
-
+"""Resumable CPU/GPU reconstruction orchestration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from pathlib import Path
 
 from app.config import settings
 from app.db import SessionLocal
-from app.dispatch import DispatchNotConfigured, dispatch_to_gpu_worker
+from app.dispatch import get_gpu_job, submit_gpu_job
 from app.models import Job, JobStatus
 from app.pipeline import extract_frames
-from app.storage import get_storage
+from app.storage import S3Storage, get_storage
 
 logger = logging.getLogger(__name__)
-
 SCRATCH_DIR = Path(settings.storage_local_path).parent / "scratch"
+
+
+async def _set(job, session, status: JobStatus, progress: int, detail: str) -> None:
+    job.status, job.progress_percent, job.stage_detail = status, progress, detail
+    job.error_message = None
+    await session.commit()
+
+
+async def _prepare_frames(job, session, storage) -> list[str]:
+    artifacts = dict(job.stage_artifacts or {})
+    frame_keys = artifacts.get("frame_keys", [])
+    if frame_keys and all(storage.exists(key) for key in frame_keys):
+        await _set(job, session, JobStatus.PREPARING_FRAMES, 25, "Reusing prepared frames")
+        return frame_keys
+    await _set(job, session, JobStatus.PREPARING_FRAMES, 10, "Selecting sharp, useful frames")
+    scratch = SCRATCH_DIR / str(job.id)
+    scratch.mkdir(parents=True, exist_ok=True)
+    video_path = scratch / "input.mp4"
+    video_path.write_bytes(storage.read(job.input_storage_key))
+    result = await asyncio.to_thread(extract_frames, video_path, scratch / "frames")
+    frame_keys = []
+    for frame_path in result.frame_paths:
+        key = f"projects/{job.project_id}/jobs/{job.id}/frames/{frame_path.name}"
+        storage.save(key, frame_path.read_bytes())
+        frame_keys.append(key)
+    job.frame_count, job.selected_frame_count = result.total_frames_seen, result.selected_frame_count
+    artifacts["frame_keys"] = frame_keys
+    job.stage_artifacts = artifacts
+    await session.commit()
+    return frame_keys
+
+
+async def _run_local_demo(job, session, storage) -> None:
+    """No-cost full-flow adapter using the existing V3 result, never a GPU."""
+    await _set(job, session, JobStatus.VGGT_GEOMETRY, 42, "Estimating cameras and room geometry")
+    await asyncio.sleep(0.8)
+    await _set(job, session, JobStatus.GAUSSIAN_OPTIMIZATION, 68, "Optimizing Gaussian appearance")
+    await asyncio.sleep(0.8)
+    source_ply = Path(settings.local_demo_scene_ply).resolve()
+    source_cameras = Path(settings.local_demo_cameras_json).resolve()
+    if not source_ply.is_file():
+        raise RuntimeError(
+            f"Local demo artifact not found at {source_ply}. Set LOCAL_DEMO_SCENE_PLY, "
+            "or configure GPU_BACKEND=runpod for real reconstruction."
+        )
+    await _set(job, session, JobStatus.FINALIZING, 92, "Packaging viewer artifacts")
+    storage.save(job.output_storage_key, source_ply.read_bytes())
+    if source_cameras.is_file():
+        storage.save(job.camera_storage_key, source_cameras.read_bytes())
+
+
+async def _run_runpod(job, session, storage: S3Storage, frame_keys: list[str]) -> None:
+    if not isinstance(storage, S3Storage):
+        raise RuntimeError("GPU_BACKEND=runpod requires STORAGE_BACKEND=s3")
+    if not job.runpod_job_id:
+        await _set(job, session, JobStatus.VGGT_GEOMETRY, 32, "Queued on GPU")
+        payload = {
+            "job_id": str(job.id),
+            "frame_urls": [storage.url_for(key) for key in frame_keys],
+            "scene_upload_url": storage.upload_url_for(job.output_storage_key),
+            "cameras_upload_url": storage.upload_url_for(job.camera_storage_key),
+            "resume": job.stage_artifacts or {},
+            "quality_profile": settings.reconstruction_quality_profile,
+        }
+        job.runpod_job_id = await asyncio.to_thread(submit_gpu_job, payload)
+        await session.commit()
+    while True:
+        result = await asyncio.to_thread(get_gpu_job, job.runpod_job_id)
+        state = result.get("status")
+        output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        stage = output.get("stage")
+        if stage == "gaussian_optimization":
+            await _set(job, session, JobStatus.GAUSSIAN_OPTIMIZATION, int(output.get("progress", 65)), "Optimizing Gaussian appearance")
+        elif stage == "finalizing":
+            await _set(job, session, JobStatus.FINALIZING, int(output.get("progress", 92)), "Packaging viewer artifacts")
+        elif state in {"IN_QUEUE", "IN_PROGRESS"}:
+            await _set(job, session, JobStatus.VGGT_GEOMETRY, int(output.get("progress", 38)), "Estimating cameras and room geometry")
+        if state == "COMPLETED":
+            if not storage.exists(job.output_storage_key):
+                raise RuntimeError("GPU job completed without uploading scene.ply")
+            return
+        if state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+            raise RuntimeError(result.get("error") or f"GPU job ended with {state}")
+        await asyncio.sleep(settings.runpod_poll_seconds)
 
 
 async def run_pipeline(job_id: uuid.UUID) -> None:
     async with SessionLocal() as session:
         job = await session.get(Job, job_id)
         if job is None:
-            logger.error("run_pipeline: job %s not found", job_id)
             return
-
         try:
-            job.status = JobStatus.EXTRACTING_FRAMES
-            await session.commit()
-
             storage = get_storage()
-            video_bytes = storage.read(job.input_storage_key)
-
-            job_scratch = SCRATCH_DIR / str(job_id)
-            job_scratch.mkdir(parents=True, exist_ok=True)
-            video_path = job_scratch / "input.mp4"
-            video_path.write_bytes(video_bytes)
-
-            result = extract_frames(video_path, job_scratch / "frames")
-            job.frame_count = result.total_frames_seen
-            job.selected_frame_count = result.selected_frame_count
-            await session.commit()
-
-            # The GPU worker runs on different hardware entirely (RunPod), so it
-            # can't reach these frames on local disk -- upload each one and hand
-            # the worker presigned URLs instead, the same pattern as the input
-            # video upload, just per-frame.
-            frame_urls = []
-            for frame_path in result.frame_paths:
-                frame_key = f"projects/{job.project_id}/jobs/{job.id}/frames/{frame_path.name}"
-                storage.save(frame_key, frame_path.read_bytes())
-                frame_urls.append(storage.url_for(frame_key))
-
-            output_key = f"projects/{job.project_id}/jobs/{job.id}/output/scene.npz"
-            output_url = storage.url_for(output_key)
-            job.output_storage_key = output_key
-
-            job.status = JobStatus.DISPATCHED
-            await session.commit()
-
-            runpod_job_id = dispatch_to_gpu_worker(
-                job_id=str(job.id), frame_urls=frame_urls, output_url=output_url
-            )
-            job.runpod_job_id = runpod_job_id
-            await session.commit()
-
-        except (DispatchNotConfigured, NotImplementedError) as exc:
-            job.status = JobStatus.FAILED
-            job.error_message = str(exc)
-            await session.commit()
-        except Exception as exc:  # noqa: BLE001 -- surface any pipeline failure honestly
+            base = f"projects/{job.project_id}/jobs/{job.id}/output"
+            job.output_storage_key = job.output_storage_key or f"{base}/scene.ply"
+            job.camera_storage_key = job.camera_storage_key or f"{base}/scene_cameras.json"
+            frame_keys = await _prepare_frames(job, session, storage)
+            if settings.gpu_backend == "local":
+                await _run_local_demo(job, session, storage)
+            elif settings.gpu_backend == "runpod":
+                await _run_runpod(job, session, storage, frame_keys)
+            else:
+                raise RuntimeError(f"Unknown GPU_BACKEND={settings.gpu_backend!r}")
+            await _set(job, session, JobStatus.COMPLETE, 100, "Ready to explore")
+        except Exception as exc:
             logger.exception("Pipeline failed for job %s", job_id)
             job.status = JobStatus.FAILED
             job.error_message = f"{type(exc).__name__}: {exc}"

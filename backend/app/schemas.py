@@ -29,6 +29,10 @@ class JobOut(BaseModel):
     frame_count: int | None
     selected_frame_count: int | None
     output_storage_key: str | None
+    camera_storage_key: str | None
+    progress_percent: int
+    scene_url: str | None = None
+    cameras_url: str | None = None
     metrics: dict | None
     created_at: datetime
     updated_at: datetime

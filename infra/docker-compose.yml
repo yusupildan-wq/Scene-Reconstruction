@@ -18,15 +18,19 @@ services:
   backend:
     build:
       context: ../backend
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
     environment:
       DATABASE_URL: postgresql+asyncpg://scene:scene@postgres:5432/scene
       STORAGE_BACKEND: local
       STORAGE_LOCAL_PATH: /data/storage
+      GPU_BACKEND: local
+      LOCAL_DEMO_SCENE_PLY: /demo/v3_scene.ply
+      LOCAL_DEMO_CAMERAS_JSON: /demo/v3_scene_cameras.json
     volumes:
       - ../backend/app:/app/app
       - ../backend/alembic:/app/alembic
       - backend_storage:/data/storage
+      - ../frontend/public:/demo:ro
     ports:
       - "8000:8000"
     depends_on:

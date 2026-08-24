@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,10 @@ class JobStatus(str, enum.Enum):
     TRAINING = "training"
     COMPLETE = "complete"
     FAILED = "failed"
+    PREPARING_FRAMES = "preparing_frames"
+    VGGT_GEOMETRY = "vggt_geometry"
+    GAUSSIAN_OPTIMIZATION = "gaussian_optimization"
+    FINALIZING = "finalizing"
 
 
 class Project(Base):
@@ -46,7 +50,10 @@ class Job(Base):
     selected_frame_count: Mapped[int | None] = mapped_column(default=None)
 
     output_storage_key: Mapped[str | None] = mapped_column(String(1024), default=None)
+    camera_storage_key: Mapped[str | None] = mapped_column(String(1024), default=None)
     runpod_job_id: Mapped[str | None] = mapped_column(String(255), default=None)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    stage_artifacts: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     # Holds evaluation results once complete: held-out PSNR/SSIM/LPIPS, training
     # wall-clock time, GPU memory, etc. Populated by the worker, never fabricated

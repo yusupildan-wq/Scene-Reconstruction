@@ -29,6 +29,19 @@ The runner records exact input hashes and commands in `v3_run_manifest.json`,
 verifies the COLMAP interchange model, and leaves the complete gsplat result in
 the selected output directory.
 
+## High-quality appearance pass
+
+After the baseline geometry and trajectory pass inspection, run
+`--quality-profile high` into a new result directory. This reuses validated VGGT
+geometry, trains at full resolution for 30,000 steps, refines small pose errors,
+and enables antialiased rasterization. It never overwrites the 7k baseline.
+Per-camera appearance embeddings are deliberately excluded because those
+corrections are not contained in the portable PLY used by the WebGL viewer.
+
+```text
+python experiments/run_v3_vggt.py --scene-dir <scene> --result-dir <new-high-result> --vggt-root <vggt> --gsplat-root <gsplat> --stage train --quality-profile high
+```
+
 ## Required gates
 
 - Inspect predicted cameras and the confidence-filtered point cloud before

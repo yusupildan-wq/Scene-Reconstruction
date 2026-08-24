@@ -21,6 +21,11 @@ class Settings(BaseSettings):
 
     runpod_api_key: str | None = None
     runpod_endpoint_id: str | None = None
+    gpu_backend: str = "local"  # local simulates GPU completion without paid compute
+    local_demo_scene_ply: str = "../frontend/public/v3_scene.ply"
+    local_demo_cameras_json: str = "../frontend/public/v3_scene_cameras.json"
+    runpod_poll_seconds: float = 3.0
+    reconstruction_quality_profile: str = "high"
 
 
 settings = Settings()

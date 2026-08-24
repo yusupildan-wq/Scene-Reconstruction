@@ -11,6 +11,7 @@ production job dispatch requires.
 from __future__ import annotations
 
 import abc
+import shutil
 from pathlib import Path
 
 import boto3
@@ -23,7 +24,13 @@ class Storage(abc.ABC):
     def save(self, key: str, data: bytes) -> None: ...
 
     @abc.abstractmethod
+    def save_fileobj(self, key: str, fileobj) -> None: ...
+
+    @abc.abstractmethod
     def read(self, key: str) -> bytes: ...
+
+    @abc.abstractmethod
+    def exists(self, key: str) -> bool: ...
 
     @abc.abstractmethod
     def url_for(self, key: str) -> str:
@@ -46,8 +53,15 @@ class LocalStorage(Storage):
     def save(self, key: str, data: bytes) -> None:
         self._path(key).write_bytes(data)
 
+    def save_fileobj(self, key: str, fileobj) -> None:
+        with self._path(key).open("wb") as target:
+            shutil.copyfileobj(fileobj, target, length=1024 * 1024)
+
     def read(self, key: str) -> bytes:
         return self._path(key).read_bytes()
+
+    def exists(self, key: str) -> bool:
+        return self._path(key).is_file()
 
     def url_for(self, key: str) -> str:
         raise RuntimeError(
@@ -72,13 +86,28 @@ class S3Storage(Storage):
     def save(self, key: str, data: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
 
+    def save_fileobj(self, key: str, fileobj) -> None:
+        self.client.upload_fileobj(fileobj, self.bucket, key)
+
     def read(self, key: str) -> bytes:
         obj = self.client.get_object(Bucket=self.bucket, Key=key)
         return obj["Body"].read()
 
+    def exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except self.client.exceptions.ClientError:
+            return False
+
     def url_for(self, key: str) -> str:
         return self.client.generate_presigned_url(
             "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600
+        )
+
+    def upload_url_for(self, key: str) -> str:
+        return self.client.generate_presigned_url(
+            "put_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=86400
         )
 
 

@@ -20,8 +20,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_CACHE_DIR=/workspace/cache/pip
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-dev python3.10-venv python3-pip git ca-certificates ffmpeg \
+      python3.10 python3.10-dev python3.10-venv python3-pip git ca-certificates ffmpeg openssh-server \
       build-essential ninja-build libgl1 libglib2.0-0 && \
+    mkdir -p /run/sshd && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python3.10 -m pip install --upgrade "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1" && \
@@ -48,4 +49,4 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
 COPY . /opt/project
 RUN chmod +x /opt/project/bootstrap/*.sh
 WORKDIR /opt/project
-CMD ["bash", "/opt/project/bootstrap/start.sh"]
+CMD ["bash", "-lc", "service ssh start && /opt/project/bootstrap/start.sh && exec sleep infinity"]

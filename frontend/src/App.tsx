@@ -1,163 +1,117 @@
-import { useEffect, useState } from "react";
-import { createJob, createProject, listJobs, listProjects, Job, Project } from "./api/client";
-import JobRow from "./JobRow";
-import SceneViewer from "./SceneViewer";
+import { DragEvent, useEffect, useRef, useState } from "react";
+import { API_BASE_URL, createJob, createProject, getJob, Job, listProjects, retryJob } from "./api/client";
 import GaussianSplatViewer from "./GaussianSplatViewer";
+import SceneViewer from "./SceneViewer";
+import "./styles.css";
+
+const STAGES = [
+  ["uploading", "Uploading"], ["preparing_frames", "Preparing Frames"],
+  ["vggt_geometry", "VGGT Geometry"], ["gaussian_optimization", "Gaussian Optimization"],
+  ["finalizing", "Finalizing"],
+] as const;
+const LEGACY_STAGE: Record<string, string> = {
+  pending: "preparing_frames", extracting_frames: "preparing_frames", dispatched: "vggt_geometry",
+  running_sfm: "vggt_geometry", training: "gaussian_optimization", complete: "finalizing",
+};
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
-  const [sceneChoice, setSceneChoice] = useState<
-    | "demo_scene.json"
-    | "real_scene.json"
-    | "dust3r_scene.bin"
-    | "dust3r_scene.ply"
-    | "v3_scene.ply"
-  >("v3_scene.ply");
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [newProjectName, setNewProjectName] = useState("");
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [job, setJob] = useState<Job | null>(null);
+  const [uploadPercent, setUploadPercent] = useState(0);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [viewerUrl, setViewerUrl] = useState<string | null>(null);
+  const [experimentScene, setExperimentScene] = useState("v3_scene.ply");
 
+  useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
   useEffect(() => {
-    listProjects().then(setProjects).catch(console.error);
-  }, []);
+    if (!job || job.status === "complete" || job.status === "failed") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await getJob(job.id); setJob(next);
+        if (next.status === "complete" && next.scene_url) setViewerUrl(`${API_BASE_URL}${next.scene_url}`);
+      } catch { /* transient polling failures should not discard the job */ }
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.status]);
 
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setJobs([]);
-      return;
-    }
-    listJobs(selectedProjectId).then(setJobs).catch(console.error);
-  }, [selectedProjectId]);
-
-  async function handleCreateProject(event: React.FormEvent) {
-    event.preventDefault();
-    if (!newProjectName.trim()) return;
-    const project = await createProject(newProjectName.trim());
-    setProjects((prev) => [project, ...prev]);
-    setSelectedProjectId(project.id);
-    setNewProjectName("");
+  function choose(next: File | null) {
+    setError(null);
+    if (!next) return;
+    if (!next.type.startsWith("video/")) { setError("Choose an MP4 or another video file."); return; }
+    if (preview) URL.revokeObjectURL(preview);
+    setFile(next); setPreview(URL.createObjectURL(next)); setJob(null); setUploadPercent(0);
   }
-
-  async function handleUpload(event: React.FormEvent) {
-    event.preventDefault();
-    if (!selectedProjectId || !selectedFile) return;
-    setUploadError(null);
+  function drop(event: DragEvent) { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files[0] ?? null); }
+  async function submit() {
+    if (!file) return;
+    setUploading(true); setError(null); setUploadPercent(0);
     try {
-      const job = await createJob(selectedProjectId, selectedFile);
-      setJobs((prev) => [job, ...prev]);
-      setSelectedFile(null);
-    } catch (err) {
-      setUploadError(err instanceof Error ? err.message : String(err));
-    }
+      const projects = await listProjects();
+      const project = projects[0] ?? await createProject("My room reconstructions");
+      const created = await createJob(project.id, file, setUploadPercent);
+      setJob(created); setUploadPercent(100);
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setUploading(false); }
   }
+  async function retry() {
+    if (!job) return;
+    setError(null);
+    try { setJob(await retryJob(job.id)); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  }
+  function reset() { setViewerUrl(null); setJob(null); setFile(null); setPreview(null); setError(null); }
 
-  if (activeTab === "demo") {
-    // Full-viewport, not the constrained page layout below -- the scene
-    // should fill the screen the moment it loads, not sit in a small boxed
-    // preview under a header. Controls float on top instead of pushing the
-    // canvas down.
-    return (
-      <div style={{ position: "fixed", inset: 0, background: "#000" }}>
-        {sceneChoice.endsWith(".ply") ? (
-          <GaussianSplatViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
-        ) : (
-          <SceneViewer key={sceneChoice} sceneUrl={`/${sceneChoice}`} />
-        )}
-        <div
-          style={{
-            position: "absolute",
-            top: 12,
-            left: 12,
-            background: "rgba(0,0,0,0.6)",
-            color: "#fff",
-            padding: 12,
-            borderRadius: 8,
-            fontFamily: "system-ui, sans-serif",
-            maxWidth: 340,
-          }}
-        >
-          <div style={{ marginBottom: 8, display: "flex", gap: 8 }}>
-            <button onClick={() => setActiveTab("demo")} disabled>
-              Demo Scene
-            </button>
-            <button onClick={() => setActiveTab("projects")}>Projects</button>
-          </div>
-          <select
-            value={sceneChoice}
-            onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
-          >
-            <option value="v3_scene.ply">V3: VGGT + gsplat (1.68M Gaussians)</option>
-            <option value="dust3r_scene.ply">V1: Full room (380k Gaussians, 64 cameras)</option>
-            <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, point-sprite viewer)</option>
-            <option value="real_scene.json">My room (COLMAP + 6k iterations, V0)</option>
-            <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>
-          </select>
+  if (new URLSearchParams(window.location.search).has("experiments")) return <div className="viewer-shell">
+    {experimentScene.endsWith(".ply") ? <GaussianSplatViewer key={experimentScene} sceneUrl={`/${experimentScene}`} />
+      : <SceneViewer key={experimentScene} sceneUrl={`/${experimentScene}`} />}
+    <div className="viewer-bar"><select value={experimentScene} onChange={(e) => setExperimentScene(e.target.value)}>
+      <option value="v3_scene.ply">V3 · VGGT + gsplat</option><option value="dust3r_scene.ply">V1 · DUSt3R + gsplat</option>
+      <option value="dust3r_scene.bin">V1 point viewer</option><option value="real_scene.json">V2 · COLMAP</option>
+      <option value="demo_scene.json">Synthetic demo</option></select><button onClick={() => { window.location.search = ""; }}>Upload a room</button></div>
+  </div>;
+
+  if (viewerUrl) return <div className="viewer-shell">
+    <GaussianSplatViewer sceneUrl={viewerUrl} />
+    <div className="viewer-bar"><span>Your room</span><button onClick={reset}>New reconstruction</button></div>
+  </div>;
+
+  const current = uploading ? "uploading" : LEGACY_STAGE[job?.status ?? ""] ?? job?.status;
+  const currentIndex = STAGES.findIndex(([key]) => key === current);
+  const progress = uploading ? Math.max(2, Math.round(uploadPercent * .08)) : job?.progress_percent ?? 0;
+  const processing = uploading || (!!job && !["complete", "failed"].includes(job.status));
+
+  return <main className="page">
+    <header><div className="mark">S</div><span>Scene Reconstruction</span><a href="/?experiments=1">Experiments</a></header>
+    <section className="card">
+      {!processing && !job && <>
+        <div className="intro"><span className="eyebrow">ROOM TO 3D</span><h1>Walk through your room again.</h1>
+          <p>Upload a steady room video. We’ll reconstruct it into an interactive 3D scene.</p></div>
+        <div className={`dropzone ${dragging ? "dragging" : ""}`} onDragEnter={() => setDragging(true)}
+          onDragLeave={() => setDragging(false)} onDragOver={(e) => e.preventDefault()} onDrop={drop}
+          onClick={() => inputRef.current?.click()}>
+          <input ref={inputRef} hidden type="file" accept="video/mp4,video/quicktime,video/webm" onChange={(e) => choose(e.target.files?.[0] ?? null)} />
+          <div className="upload-icon">↑</div><strong>Drop your room video here</strong><span>or click to choose a file</span>
         </div>
-      </div>
-    );
-  }
+        {preview && file && <div className="preview"><video src={preview} controls preload="metadata" />
+          <div><strong>{file.name}</strong><span>{(file.size / 1048576).toFixed(1)} MB</span></div></div>}
+        {file && <button className="primary" onClick={submit}>Reconstruct room</button>}
+      </>}
 
-  return (
-    <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui, sans-serif" }}>
-      <h1>Scene Reconstruction</h1>
-
-      <div style={{ marginBottom: 24 }}>
-        <button onClick={() => setActiveTab("demo")}>Demo Scene</button>{" "}
-        <button onClick={() => setActiveTab("projects")} disabled>
-          Projects
-        </button>
-      </div>
-
-      <section style={{ marginBottom: 32 }}>
-        <h2>Projects</h2>
-        <form onSubmit={handleCreateProject} style={{ marginBottom: 12 }}>
-          <input
-            value={newProjectName}
-            onChange={(e) => setNewProjectName(e.target.value)}
-            placeholder="New project name"
-          />
-          <button type="submit">Create</button>
-        </form>
-        <select
-          value={selectedProjectId ?? ""}
-          onChange={(e) => setSelectedProjectId(e.target.value || null)}
-        >
-          <option value="">Select a project…</option>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-      </section>
-
-      {selectedProjectId && (
-        <section>
-          <h2>Upload video</h2>
-          <form onSubmit={handleUpload} style={{ marginBottom: 24 }}>
-            <input
-              type="file"
-              accept="video/*"
-              onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
-            />
-            <button type="submit" disabled={!selectedFile}>
-              Upload &amp; start job
-            </button>
-          </form>
-          {uploadError && <p style={{ color: "crimson" }}>{uploadError}</p>}
-
-          <h2>Jobs</h2>
-          {jobs.length === 0 && <p>No jobs yet.</p>}
-          <ul style={{ listStyle: "none", padding: 0 }}>
-            {jobs.map((job) => (
-              <JobRow key={job.id} initialJob={job} />
-            ))}
-          </ul>
-        </section>
-      )}
-    </div>
-  );
+      {(processing || job) && <div className="progress-view">
+        <div className="spinner-or-check">{job?.status === "failed" ? "!" : "◌"}</div>
+        <span className="eyebrow">{job?.status === "failed" ? "RECONSTRUCTION PAUSED" : "BUILDING YOUR SCENE"}</span>
+        <h2>{job?.status === "failed" ? "Something interrupted the reconstruction" : job?.stage_detail || "Uploading your video"}</h2>
+        <p>{job?.status === "failed" ? "Your completed work is saved. Retry continues from the last reusable stage." : "You can leave this tab open while we turn the video into a navigable room."}</p>
+        {job?.status !== "failed" && <><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><b className="percent">{progress}%</b>
+          <ol className="stages">{STAGES.map(([key, label], i) => <li key={key} className={i < currentIndex ? "done" : i === currentIndex ? "active" : ""}>
+            <span>{i < currentIndex ? "✓" : i + 1}</span><em>{label}</em></li>)}</ol></>}
+        {job?.status === "failed" && <button className="primary" onClick={retry}>Retry from saved progress</button>}
+      </div>}
+      {(error || job?.error_message) && <div className="error">{error || job?.error_message}</div>}
+    </section>
+    <footer>Best results: move slowly, keep objects in view, and avoid abrupt turns.</footer>
+  </main>;
 }

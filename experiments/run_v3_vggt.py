@@ -18,6 +18,21 @@ from pathlib import Path
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 COLMAP_FILES = ("cameras.bin", "images.bin", "points3D.bin")
+QUALITY_PROFILES = {
+    "baseline": {"data_factor": 2, "max_steps": 7_000, "pose_opt": False, "antialiased": False},
+    # Per-camera appearance models are excluded: those corrections are not
+    # represented in the portable PLY consumed by the browser viewer.
+    "high": {"data_factor": 1, "max_steps": 30_000, "pose_opt": True, "antialiased": True},
+}
+
+
+def resolve_quality_profile(args: argparse.Namespace) -> dict[str, object]:
+    config = dict(QUALITY_PROFILES[args.quality_profile])
+    for name in ("data_factor", "max_steps", "pose_opt", "antialiased"):
+        value = getattr(args, name, None)
+        if value is not None:
+            config[name] = value
+    return config
 
 
 def image_manifest(images_dir: Path) -> list[dict[str, object]]:
@@ -61,11 +76,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vggt-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--gsplat-python", type=Path, default=Path(sys.executable))
     parser.add_argument("--stage", choices=("geometry", "train", "all"), default="all")
+    parser.add_argument("--quality-profile", choices=tuple(QUALITY_PROFILES), default="baseline")
     parser.add_argument("--use-ba", action="store_true")
     parser.add_argument("--query-frame-num", type=int, default=16)
     parser.add_argument("--max-query-pts", type=int, default=4096)
-    parser.add_argument("--data-factor", type=int, default=2)
-    parser.add_argument("--max-steps", type=int, default=7000)
+    parser.add_argument("--data-factor", type=int)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--pose-opt", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--antialiased", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--force-geometry", action="store_true")
     parser.add_argument("--force-training", action="store_true")
     return parser.parse_args()
@@ -73,6 +91,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    quality = resolve_quality_profile(args)
     scene_dir = args.scene_dir.resolve()
     result_dir = args.result_dir.resolve()
     vggt_root = args.vggt_root.resolve()
@@ -96,23 +115,29 @@ def main() -> None:
         "examples/simple_trainer.py",
         "default",
         "--data-factor",
-        str(args.data_factor),
+        str(quality["data_factor"]),
         "--data-dir",
         str(scene_dir),
         "--result-dir",
         str(result_dir),
         "--max-steps",
-        str(args.max_steps),
+        str(quality["max_steps"]),
         "--save-ply",
         "--disable-viewer",
         "--disable-video",
     ]
+    if quality["pose_opt"]:
+        training_command.append("--pose-opt")
+    if quality["antialiased"]:
+        training_command.append("--antialiased")
 
     manifest = {
         "pipeline": "V3 VGGT -> COLMAP interchange -> gsplat",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "stage": args.stage,
         "use_bundle_adjustment": args.use_ba,
+        "quality_profile": args.quality_profile,
+        "quality_config": quality,
         "input_count": len(inputs),
         "inputs": inputs,
         "geometry_command": geometry_command,
