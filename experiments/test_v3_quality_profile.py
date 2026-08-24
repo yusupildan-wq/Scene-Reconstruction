@@ -1,7 +1,8 @@
 import argparse
 import unittest
+from pathlib import Path
 
-from experiments.run_v3_vggt import resolve_quality_profile
+from experiments.run_v3_vggt import ply_step, resolve_quality_profile
 
 
 class V3QualityProfileTests(unittest.TestCase):
@@ -20,6 +21,10 @@ class V3QualityProfileTests(unittest.TestCase):
         self.assertEqual((config["data_factor"], config["max_steps"]), (2, 12_000))
         self.assertFalse(config["pose_opt"])
         self.assertFalse(config["antialiased"])
+
+    def test_ply_steps_sort_numerically(self):
+        paths = [Path("point_cloud_6999.ply"), Path("point_cloud_29999.ply")]
+        self.assertEqual(sorted(paths, key=ply_step)[-1].name, "point_cloud_29999.ply")
 
 
 if __name__ == "__main__":

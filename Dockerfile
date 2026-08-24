@@ -49,4 +49,4 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
 COPY . /opt/project
 RUN chmod +x /opt/project/bootstrap/*.sh
 WORKDIR /opt/project
-CMD ["bash", "-lc", "service ssh start && /opt/project/bootstrap/start.sh && exec sleep infinity"]
+CMD ["bash", "-lc", "mkdir -p /root/.ssh && printf '%s\\n' \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && service ssh start && /opt/project/bootstrap/start.sh && exec sleep infinity"]

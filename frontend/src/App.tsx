@@ -24,7 +24,7 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
-  const [experimentScene, setExperimentScene] = useState("v3_scene.ply");
+  const [experimentScene, setExperimentScene] = useState("v3_scene_high.ply");
 
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
   useEffect(() => {
@@ -68,7 +68,8 @@ export default function App() {
     {experimentScene.endsWith(".ply") ? <GaussianSplatViewer key={experimentScene} sceneUrl={`/${experimentScene}`} />
       : <SceneViewer key={experimentScene} sceneUrl={`/${experimentScene}`} />}
     <div className="viewer-bar"><select value={experimentScene} onChange={(e) => setExperimentScene(e.target.value)}>
-      <option value="v3_scene.ply">V3 · VGGT + gsplat</option><option value="dust3r_scene.ply">V1 · DUSt3R + gsplat</option>
+      <option value="v3_scene_high.ply">V3 High · VGGT + gsplat (3.43M)</option>
+      <option value="v3_scene.ply">V3 Baseline · VGGT + gsplat (1.68M)</option><option value="dust3r_scene.ply">V1 · DUSt3R + gsplat</option>
       <option value="dust3r_scene.bin">V1 point viewer</option><option value="real_scene.json">V2 · COLMAP</option>
       <option value="demo_scene.json">Synthetic demo</option></select><button onClick={() => { window.location.search = ""; }}>Upload a room</button></div>
   </div>;

@@ -26,6 +26,14 @@ QUALITY_PROFILES = {
 }
 
 
+def ply_step(path: Path) -> int:
+    """Return the numeric training step embedded in a gsplat PLY filename."""
+    try:
+        return int(path.stem.rsplit("_", 1)[1])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"Unexpected gsplat PLY filename: {path.name}") from error
+
+
 def resolve_quality_profile(args: argparse.Namespace) -> dict[str, object]:
     config = dict(QUALITY_PROFILES[args.quality_profile])
     for name in ("data_factor", "max_steps", "pose_opt", "antialiased"):
@@ -167,7 +175,7 @@ def main() -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     if args.stage in {"train", "all"}:
-        completed_plys = sorted((result_dir / "ply").glob("point_cloud_*.ply"))
+        completed_plys = sorted((result_dir / "ply").glob("point_cloud_*.ply"), key=ply_step)
         if completed_plys and not args.force_training:
             print(f"Reusing completed training export: {completed_plys[-1]}")
         else:
@@ -176,7 +184,7 @@ def main() -> None:
             except Exception:
                 (stage_dir / "training.failed").write_text(datetime.now(timezone.utc).isoformat())
                 raise
-        completed_plys = sorted((result_dir / "ply").glob("point_cloud_*.ply"))
+        completed_plys = sorted((result_dir / "ply").glob("point_cloud_*.ply"), key=ply_step)
         if not completed_plys:
             raise RuntimeError("gsplat exited without a final PLY export")
         (stage_dir / "training.ok").write_text(datetime.now(timezone.utc).isoformat())

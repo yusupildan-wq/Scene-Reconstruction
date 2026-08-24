@@ -9,6 +9,7 @@ node_modules/
 frontend/dist/
 frontend/vite*.log
 frontend/public/v3_scene.ply
+frontend/public/v3_scene_high.ply
 *.tsbuildinfo
 
 .DS_Store
