@@ -1,4 +1,9 @@
-# GPU worker (not implemented yet)
+# GPU worker
+
+The old unverified `worker/Dockerfile` has been retired. The only supported GPU
+runtime is the pinned root `Dockerfile`; see `RUNPOD_SETUP.md` and
+`bootstrap/README.md`. Do not recreate a floating worker image or install
+dependencies during normal RunPod startup.
 
 Runs on RunPod. Given a video already uploaded to S3-compatible storage, this
 container is meant to:

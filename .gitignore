@@ -7,6 +7,8 @@ backend/.env
 
 node_modules/
 frontend/dist/
+frontend/vite*.log
+frontend/public/v3_scene.ply
 *.tsbuildinfo
 
 .DS_Store
@@ -17,3 +19,4 @@ experiments/artifacts/**/frames/
 experiments/artifacts/**/contact_sheet.jpg
 experiments/artifacts/**/*.bin
 experiments/artifacts/**/*_cameras.json
+bootstrap/preflight-report.json

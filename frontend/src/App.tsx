@@ -7,8 +7,12 @@ import GaussianSplatViewer from "./GaussianSplatViewer";
 export default function App() {
   const [activeTab, setActiveTab] = useState<"projects" | "demo">("demo");
   const [sceneChoice, setSceneChoice] = useState<
-    "demo_scene.json" | "real_scene.json" | "dust3r_scene.bin" | "dust3r_scene.ply"
-  >("dust3r_scene.ply");
+    | "demo_scene.json"
+    | "real_scene.json"
+    | "dust3r_scene.bin"
+    | "dust3r_scene.ply"
+    | "v3_scene.ply"
+  >("v3_scene.ply");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
@@ -85,7 +89,8 @@ export default function App() {
             value={sceneChoice}
             onChange={(e) => setSceneChoice(e.target.value as typeof sceneChoice)}
           >
-            <option value="dust3r_scene.ply">Full room (380k Gaussians, 64 cameras)</option>
+            <option value="v3_scene.ply">V3: VGGT + gsplat (1.68M Gaussians)</option>
+            <option value="dust3r_scene.ply">V1: Full room (380k Gaussians, 64 cameras)</option>
             <option value="dust3r_scene.bin">My room (DUSt3R + 20k iterations, point-sprite viewer)</option>
             <option value="real_scene.json">My room (COLMAP + 6k iterations, V0)</option>
             <option value="demo_scene.json">Synthetic test scene (1000 iterations)</option>

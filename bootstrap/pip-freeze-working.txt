@@ -1,0 +1,9 @@
+# Captured contract for the verified V3 family. The Docker build produces the
+# authoritative complete freeze for each isolated environment. Validate/update
+# this file only after the image passes bootstrap/verify_env.sh on a real GPU.
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124
+numpy==1.26.4
+gsplat==1.5.3+pt24cu124
+pycolmap==3.10.0  # VGGT environment only
+pyceres==2.3

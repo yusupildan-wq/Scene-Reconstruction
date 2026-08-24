@@ -10,18 +10,39 @@ const MAX_FOV = 90;
 // real camera-to-world matrices from training, so the viewer can start
 // exactly where a real photo was taken instead of guessing a position.
 // Older/other exports won't have this file; 404 is expected and handled.
-async function loadCameraPoses(plyUrl: string): Promise<THREE.Matrix4[] | null> {
+type CameraPoseSidecar = {
+  camera_to_world_matrices?: number[][];
+  frames?: Array<{ transform_matrix?: number[][] | number[] }>;
+  scene_scale_factor?: number;
+  coordinate_convention?: "opencv" | "opengl";
+  world_up?: "y" | "z";
+};
+
+type LoadedCameraPoses = {
+  poses: THREE.Matrix4[];
+  worldRotation: THREE.Quaternion;
+};
+
+async function loadCameraPoses(plyUrl: string): Promise<LoadedCameraPoses | null> {
   const url = plyUrl.replace(/\.ply$/, "_cameras.json");
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
-    const data = (await res.json()) as {
-      camera_to_world_matrices: number[][];
-      scene_scale_factor?: number;
-    };
+    const data = (await res.json()) as CameraPoseSidecar;
     const sceneScale = data.scene_scale_factor ?? 1;
-    return data.camera_to_world_matrices.map((flat) => {
-      const pose = new THREE.Matrix4().fromArray(flat);
+    const matrices = data.camera_to_world_matrices ?? data.frames?.flatMap((frame) => {
+      if (!frame.transform_matrix) return [];
+      const matrix = frame.transform_matrix;
+      return [Array.isArray(matrix[0]) ? (matrix as number[][]).flat() : (matrix as number[])];
+    });
+    if (!matrices?.length) return null;
+    const poses = matrices.map((flat) => {
+      // Existing project sidecars are column-major. Nerfstudio-style nested
+      // transform_matrix values are row-major and were flattened above.
+      const isNerfstudioFrame = data.camera_to_world_matrices == null;
+      const pose = new THREE.Matrix4();
+      if (isNerfstudioFrame) pose.fromArray(flat).transpose();
+      else pose.fromArray(flat);
       // convert_bin_to_ply.py uniformly scales Gaussian positions to avoid
       // tiny covariance values in the browser renderer. Camera translations
       // must receive the same scale or the exported photographed viewpoint is
@@ -29,11 +50,34 @@ async function loadCameraPoses(plyUrl: string): Promise<THREE.Matrix4[] | null> 
       pose.elements[12] *= sceneScale;
       pose.elements[13] *= sceneScale;
       pose.elements[14] *= sceneScale;
+      // gsplat trains with OpenCV cameras (+Y down, +Z forward), while
+      // Three.js cameras use +Y up and look down -Z.
+      if (data.coordinate_convention === "opencv") {
+        pose.multiply(new THREE.Matrix4().makeScale(1, -1, -1));
+      }
       return pose;
     });
+
+    // PCA-normalized reconstructions do not have a guaranteed world-up axis.
+    // A phone is held approximately upright, so the robust average of the
+    // photographed cameras' local +Y axes gives us the room's actual up.
+    const averageUp = poses.reduce((sum, pose) => {
+      const elements = pose.elements;
+      return sum.add(new THREE.Vector3(elements[4], elements[5], elements[6]).normalize());
+    }, new THREE.Vector3()).normalize();
+    const worldRotation = new THREE.Quaternion().setFromUnitVectors(averageUp, new THREE.Vector3(0, 1, 0));
+    const worldMatrix = new THREE.Matrix4().makeRotationFromQuaternion(worldRotation);
+    poses.forEach((pose) => pose.premultiply(worldMatrix));
+    return { poses, worldRotation };
   } catch {
     return null;
   }
+}
+
+function removeCameraRoll(camera: THREE.PerspectiveCamera) {
+  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(camera.position.clone().add(forward));
 }
 
 // Renders real oriented-ellipsoid Gaussian Splats (via a proven third-party
@@ -49,20 +93,23 @@ async function loadCameraPoses(plyUrl: string): Promise<THREE.Matrix4[] | null> 
 // position is an approximation of standing in the room, not a true
 // eye-level placement on a known floor.
 export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) {
+  const isV3 = sceneUrl.endsWith("/v3_scene.ply");
   const containerRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const cameraPosesRef = useRef<THREE.Matrix4[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
-  const [activeView, setActiveView] = useState(15);
-  const [viewOptions, setViewOptions] = useState([0, 7, 15, 23, 31]);
+  const [activeView, setActiveView] = useState<number | null>(null);
+  const [viewOptions, setViewOptions] = useState<number[]>([]);
+  const [hasCameraPoses, setHasCameraPoses] = useState(false);
 
   const jumpToTrainingView = (viewIndex: number) => {
     const camera = cameraRef.current;
     const pose = cameraPosesRef.current[viewIndex];
     if (!camera || !pose) return;
     pose.decompose(camera.position, camera.quaternion, new THREE.Vector3());
+    if (isV3) removeCameraRoll(camera);
     camera.updateMatrixWorld(true);
     setActiveView(viewIndex);
   };
@@ -88,7 +135,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
     const controls = new PointerLockControls(camera, renderer.domElement);
     // This scene's imported camera basis makes PointerLockControls feel
     // horizontally reversed; invert look input while retaining corrected WASD.
-    controls.pointerSpeed = -1;
+    controls.pointerSpeed = isV3 ? 1 : -1;
     const handleLock = () => setIsLocked(true);
     const handleUnlock = () => setIsLocked(false);
     controls.addEventListener("lock", handleLock);
@@ -146,9 +193,15 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
     // throws synchronously ("File format not supported"), outside this
     // promise chain, so don't add one here.
     Promise.all([splatViewer.addSplatScenes([{ path: sceneUrl }], false), loadCameraPoses(sceneUrl)])
-      .then(([, cameraPoses]) => {
+      .then(([, cameraData]) => {
         if (disposed) return;
         setLoaded(true);
+
+        if (cameraData && isV3) {
+          splatViewer.quaternion.copy(cameraData.worldRotation);
+          splatViewer.updateMatrixWorld(true);
+        }
+        const cameraPoses = cameraData?.poses ?? null;
 
         // .ply positions aren't pre-centered around the origin the way our
         // own .bin/.json exports were -- start from the real loaded bounds
@@ -167,6 +220,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
 
         if (cameraPoses && cameraPoses.length > 0) {
           cameraPosesRef.current = cameraPoses;
+          setHasCameraPoses(true);
           const lastView = cameraPoses.length - 1;
           setViewOptions(
             Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((fraction) => Math.round(lastView * fraction))))
@@ -181,8 +235,12 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
           pose.decompose(position, quaternion, scale);
           camera.position.copy(position);
           camera.quaternion.copy(quaternion);
+          if (isV3) removeCameraRoll(camera);
           setActiveView(initialView);
         } else {
+          setHasCameraPoses(false);
+          setActiveView(null);
+          setViewOptions([]);
           // No pose data for this scene (older export) -- the raw centroid
           // of every Gaussian's position can land inside a wall or dense
           // clutter for a room scanned from around it, which renders as
@@ -221,8 +279,8 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         // The imported training-camera convention faces opposite Three.js's
         // default local forward axis, so compensate here to preserve normal
         // first-person controls: W advances and S retreats.
-        if (keys.forward) controls.moveForward(-step);
-        if (keys.backward) controls.moveForward(step);
+        if (keys.forward) controls.moveForward(isV3 ? step : -step);
+        if (keys.backward) controls.moveForward(isV3 ? -step : step);
         if (keys.right) controls.moveRight(step);
         if (keys.left) controls.moveRight(-step);
       }
@@ -258,7 +316,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
       cameraRef.current = null;
       cameraPosesRef.current = [];
     };
-  }, [sceneUrl]);
+  }, [sceneUrl, isV3]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
@@ -266,12 +324,12 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         ref={containerRef}
         style={{ width: "100%", height: "100%", background: "#111", cursor: isLocked ? "none" : "pointer" }}
       />
-      {loaded && (
+      {loaded && hasCameraPoses && (
         <div
           onClick={(event) => event.stopPropagation()}
           style={{
             position: "absolute",
-            top: 16,
+            bottom: 16,
             left: 16,
             display: "flex",
             gap: 6,
@@ -302,6 +360,23 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
           ))}
         </div>
       )}
+      {loaded && !hasCameraPoses && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 16,
+            left: 16,
+            padding: "8px 10px",
+            borderRadius: 8,
+            background: "rgba(120,53,15,0.88)",
+            color: "white",
+            fontFamily: "system-ui, sans-serif",
+            fontSize: 14,
+          }}
+        >
+          Overview only — no training-camera metadata was exported
+        </div>
+      )}
       {loaded && !isLocked && (
         <div
           style={{
@@ -317,7 +392,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
             pointerEvents: "none",
           }}
         >
-          Click to look around — WASD to move, scroll to zoom
+          Click to look — mouse turns • W/S forward/back • A/D left/right • scroll zooms
         </div>
       )}
       {error && (
