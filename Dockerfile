@@ -20,7 +20,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_CACHE_DIR=/workspace/cache/pip
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.10 python3.10-venv python3-pip git ca-certificates ffmpeg \
+      python3.10 python3.10-dev python3.10-venv python3-pip git ca-certificates ffmpeg \
       build-essential ninja-build libgl1 libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
