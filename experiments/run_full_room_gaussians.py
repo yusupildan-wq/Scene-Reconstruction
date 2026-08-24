@@ -23,6 +23,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "worker"))
 
 from experiments.convert_bin_to_ply import convert_npz
+from experiments.robust_fusion import (
+    RobustFusionConfig,
+    concatenation_fusion,
+    robust_consensus_fusion,
+)
 
 
 PROFILES = {
@@ -285,6 +290,8 @@ def load_scene(
     target_long_edge: int,
     max_initial_points: int,
     excluded_view_indices: list[int] | None = None,
+    fusion_mode: str = "concatenation",
+    fusion_config: RobustFusionConfig | None = None,
 ):
     from runner import ReconstructedScene
 
@@ -349,9 +356,20 @@ def load_scene(
         K[1, (1, 2)] *= sy
         scaled_Ks.append(K)
 
+    if fusion_mode == "concatenation":
+        fused_xyz, fused_rgb, fusion_stats = concatenation_fusion(
+            initial_xyz, initial_rgb
+        )
+    elif fusion_mode == "robust_consensus":
+        fused_xyz, fused_rgb, fusion_stats = robust_consensus_fusion(
+            initial_xyz, initial_rgb, fusion_config
+        )
+    else:
+        raise ValueError(f"Unknown fusion mode: {fusion_mode}")
+
     scene = ReconstructedScene(
-        points_xyz=np.concatenate(initial_xyz).astype(np.float32),
-        points_rgb=np.concatenate(initial_rgb).astype(np.float32),
+        points_xyz=fused_xyz,
+        points_rgb=fused_rgb,
         camera_viewmats=viewmats,
         camera_Ks=scaled_Ks,
         camera_images=camera_images,
@@ -364,10 +382,49 @@ def load_scene(
         "valid_points_median": float(np.median(counts)),
         "valid_points_max": int(counts.max()),
         "initial_points": int(len(scene.points_xyz)),
+        "fusion": fusion_stats,
         "target_size": list(camera_images[0].shape[:2]),
         "reprojection": reprojection,
     }
     return scene, report
+
+
+def _load_exposure_parameters(
+    output_dir: Path, camera_count: int, expected_step: int | None = None
+):
+    """Read learned exposure transforms without constructing training state."""
+    import torch
+
+    checkpoint = output_dir / "checkpoints" / "training_state_latest.pt"
+    if not checkpoint.exists():
+        return None
+    data = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if expected_step is not None and int(data.get("step", -1)) != expected_step:
+        raise RuntimeError(
+            "Exposure checkpoint step does not match Gaussian export step"
+        )
+    gains = data.get("exposure_log_gains")
+    biases = data.get("exposure_biases")
+    if gains is None or biases is None:
+        return None
+    if tuple(gains.shape) != (camera_count, 3) or tuple(biases.shape) != (
+        camera_count,
+        3,
+    ):
+        raise RuntimeError(
+            "Saved exposure parameters do not match evaluation camera count"
+        )
+    return gains, biases
+
+
+def _image_quality(rendered, target, ssim_function) -> dict[str, float]:
+    import torch
+
+    mse = torch.mean((rendered - target) ** 2)
+    return {
+        "psnr": float(-10.0 * torch.log10(mse.clamp_min(1e-12))),
+        "ssim": float(ssim_function(rendered, target)),
+    }
 
 
 def evaluate_latest(scene, output_dir: Path, views: int = 8) -> None:
@@ -392,6 +449,12 @@ def evaluate_latest(scene, output_dir: Path, views: int = 8) -> None:
     sh_degree = int(data["sh_degree"]) if "sh_degree" in data else None
     color_key = "sh_coeffs" if sh_degree is not None else "colors"
     colors = torch.tensor(data[color_key], device=device)
+    exposure = _load_exposure_parameters(
+        output_dir, len(scene.camera_images), expected_step=step_number(export)
+    )
+    if exposure is not None:
+        exposure_log_gains = exposure[0].to(device)
+        exposure_biases = exposure[1].to(device)
     indices = np.linspace(0, len(scene.camera_images) - 1, views, dtype=int)
     metrics, rows = [], []
     with torch.no_grad():
@@ -405,17 +468,58 @@ def evaluate_latest(scene, output_dir: Path, views: int = 8) -> None:
                 width, height, sh_degree=sh_degree,
             )
             rendered = render[0].clamp(0, 1)
-            mse = torch.mean((rendered - target) ** 2)
-            psnr = float(-10.0 * torch.log10(mse.clamp_min(1e-12)))
-            ssim = float(_ssim(rendered, target))
-            metrics.append({"view": int(index), "psnr": psnr, "ssim": ssim})
+            canonical = _image_quality(rendered, target, _ssim)
+            adjusted = None
+            adjusted_render = None
+            if exposure is not None:
+                adjusted_render = (
+                    render[0] * torch.exp(exposure_log_gains[index])
+                    + exposure_biases[index]
+                ).clamp(0, 1)
+                adjusted = _image_quality(adjusted_render, target, _ssim)
+            metrics.append(
+                {
+                    "view": int(index),
+                    # Preserve the original fields as canonical metrics for
+                    # downstream readers while adding an explicit comparison.
+                    **canonical,
+                    "canonical": canonical,
+                    "exposure_adjusted": adjusted,
+                }
+            )
             real_u8 = (target.cpu().numpy() * 255).astype(np.uint8)
             render_u8 = (rendered.cpu().numpy() * 255).astype(np.uint8)
-            rows.append(np.concatenate((real_u8, render_u8), axis=1))
+            panels = [real_u8, render_u8]
+            if adjusted_render is not None:
+                panels.append(
+                    (adjusted_render.cpu().numpy() * 255).astype(np.uint8)
+                )
+            rows.append(np.concatenate(panels, axis=1))
+    adjusted_metrics = [
+        item["exposure_adjusted"]
+        for item in metrics
+        if item["exposure_adjusted"] is not None
+    ]
     report = {
         "source": export.name,
         "mean_psnr": float(np.mean([item["psnr"] for item in metrics])),
         "mean_ssim": float(np.mean([item["ssim"] for item in metrics])),
+        "canonical": {
+            "mean_psnr": float(np.mean([item["psnr"] for item in metrics])),
+            "mean_ssim": float(np.mean([item["ssim"] for item in metrics])),
+        },
+        "exposure_adjusted": (
+            {
+                "mean_psnr": float(
+                    np.mean([item["psnr"] for item in adjusted_metrics])
+                ),
+                "mean_ssim": float(
+                    np.mean([item["ssim"] for item in adjusted_metrics])
+                ),
+            }
+            if adjusted_metrics
+            else None
+        ),
         "views": metrics,
     }
     report_path = output_dir / "evaluation_latest.json"
@@ -436,9 +540,32 @@ def main() -> None:
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--target-long-edge", type=int)
     parser.add_argument("--max-initial-points", type=int)
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("concatenation", "robust_consensus"),
+        default="concatenation",
+    )
+    parser.add_argument("--fusion-voxel-size", type=float, default=0.01)
+    parser.add_argument("--fusion-min-view-support", type=int, default=2)
+    parser.add_argument(
+        "--fusion-max-position-disagreement", type=float, default=0.02
+    )
+    parser.add_argument("--fusion-mad-multiplier", type=float, default=3.0)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--diagnose-cross-view", action="store_true")
+    parser.add_argument(
+        "--camera-sampling",
+        choices=("sequential", "shuffled_cycle"),
+        default="sequential",
+        help="Opt-in balanced camera-cycle order; sequential preserves baseline",
+    )
+    parser.add_argument("--camera-sampling-seed", type=int, default=0)
+    parser.add_argument(
+        "--densify-camera-cycles",
+        type=int,
+        help="Refine once per N complete camera cycles instead of every 100 steps",
+    )
     args = parser.parse_args()
     config = resolve_profile(args.profile, args)
     output_dir = args.output_dir or args.run_dir
@@ -459,8 +586,20 @@ def main() -> None:
         config["target_long_edge"],
         config["max_initial_points"],
         excluded,
+        args.fusion_mode,
+        RobustFusionConfig(
+            voxel_size=args.fusion_voxel_size,
+            min_view_support=args.fusion_min_view_support,
+            max_position_disagreement=args.fusion_max_position_disagreement,
+            mad_multiplier=args.fusion_mad_multiplier,
+        ),
     )
     report["profile"] = args.profile
+    report["training_conflict_config"] = {
+        "camera_sampling": args.camera_sampling,
+        "camera_sampling_seed": args.camera_sampling_seed,
+        "densify_camera_cycles": args.densify_camera_cycles,
+    }
     report_path = output_dir / "geometry_validation.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
@@ -490,6 +629,9 @@ def main() -> None:
         optimize_camera_poses=False,
         learning_rate_decay_step=config["learning_rate_decay_step"],
         sh_degree=config["sh_degree"],
+        camera_sampling=args.camera_sampling,
+        camera_sampling_seed=args.camera_sampling_seed,
+        densify_interval_camera_cycles=args.densify_camera_cycles,
         return_training_state=True,
     )
     save_training_state(state, latest)
