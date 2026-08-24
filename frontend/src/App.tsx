@@ -3,6 +3,7 @@ import { API_BASE_URL, createJob, createProject, getJob, Job, listProjects, retr
 import GaussianSplatViewer from "./GaussianSplatViewer";
 import SceneViewer from "./SceneViewer";
 import "./styles.css";
+import "./viewer-controls.css";
 
 const STAGES = [
   ["uploading", "Uploading"], ["preparing_frames", "Preparing Frames"],

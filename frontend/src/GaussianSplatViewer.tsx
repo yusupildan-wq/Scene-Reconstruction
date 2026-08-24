@@ -93,7 +93,8 @@ function removeCameraRoll(camera: THREE.PerspectiveCamera) {
 // position is an approximation of standing in the room, not a true
 // eye-level placement on a known floor.
 export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) {
-  const isV3 = sceneUrl.endsWith("/v3_scene.ply");
+  // All V3 quality profiles share VGGT/gsplat's coordinate convention.
+  const isV3 = /\/v3_scene(?:_[^/]+)?\.ply(?:$|\?)/.test(sceneUrl);
   const containerRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const cameraPosesRef = useRef<THREE.Matrix4[]>([]);
