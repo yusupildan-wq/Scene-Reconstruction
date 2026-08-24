@@ -21,6 +21,7 @@ type CameraPoseSidecar = {
 type LoadedCameraPoses = {
   poses: THREE.Matrix4[];
   worldRotation: THREE.Quaternion;
+  usesOpenCvCoordinates: boolean;
 };
 
 async function loadCameraPoses(plyUrl: string): Promise<LoadedCameraPoses | null> {
@@ -68,7 +69,11 @@ async function loadCameraPoses(plyUrl: string): Promise<LoadedCameraPoses | null
     const worldRotation = new THREE.Quaternion().setFromUnitVectors(averageUp, new THREE.Vector3(0, 1, 0));
     const worldMatrix = new THREE.Matrix4().makeRotationFromQuaternion(worldRotation);
     poses.forEach((pose) => pose.premultiply(worldMatrix));
-    return { poses, worldRotation };
+    return {
+      poses,
+      worldRotation,
+      usesOpenCvCoordinates: data.coordinate_convention === "opencv",
+    };
   } catch {
     return null;
   }
@@ -93,11 +98,10 @@ function removeCameraRoll(camera: THREE.PerspectiveCamera) {
 // position is an approximation of standing in the room, not a true
 // eye-level placement on a known floor.
 export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) {
-  // All V3 quality profiles share VGGT/gsplat's coordinate convention.
-  const isV3 = /\/v3_scene(?:_[^/]+)?\.ply(?:$|\?)/.test(sceneUrl);
   const containerRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const cameraPosesRef = useRef<THREE.Matrix4[]>([]);
+  const usesOpenCvCoordinatesRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
@@ -110,7 +114,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
     const pose = cameraPosesRef.current[viewIndex];
     if (!camera || !pose) return;
     pose.decompose(camera.position, camera.quaternion, new THREE.Vector3());
-    if (isV3) removeCameraRoll(camera);
+    if (usesOpenCvCoordinatesRef.current) removeCameraRoll(camera);
     camera.updateMatrixWorld(true);
     setActiveView(viewIndex);
   };
@@ -136,7 +140,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
     const controls = new PointerLockControls(camera, renderer.domElement);
     // This scene's imported camera basis makes PointerLockControls feel
     // horizontally reversed; invert look input while retaining corrected WASD.
-    controls.pointerSpeed = isV3 ? 1 : -1;
+    controls.pointerSpeed = -1;
     const handleLock = () => setIsLocked(true);
     const handleUnlock = () => setIsLocked(false);
     controls.addEventListener("lock", handleLock);
@@ -198,7 +202,10 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         if (disposed) return;
         setLoaded(true);
 
-        if (cameraData && isV3) {
+        const usesOpenCvCoordinates = cameraData?.usesOpenCvCoordinates ?? false;
+        usesOpenCvCoordinatesRef.current = usesOpenCvCoordinates;
+        controls.pointerSpeed = usesOpenCvCoordinates ? 1 : -1;
+        if (cameraData && usesOpenCvCoordinates) {
           splatViewer.quaternion.copy(cameraData.worldRotation);
           splatViewer.updateMatrixWorld(true);
         }
@@ -236,7 +243,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
           pose.decompose(position, quaternion, scale);
           camera.position.copy(position);
           camera.quaternion.copy(quaternion);
-          if (isV3) removeCameraRoll(camera);
+          if (usesOpenCvCoordinates) removeCameraRoll(camera);
           setActiveView(initialView);
         } else {
           setHasCameraPoses(false);
@@ -280,8 +287,9 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         // The imported training-camera convention faces opposite Three.js's
         // default local forward axis, so compensate here to preserve normal
         // first-person controls: W advances and S retreats.
-        if (keys.forward) controls.moveForward(isV3 ? step : -step);
-        if (keys.backward) controls.moveForward(isV3 ? -step : step);
+        const forwardSign = usesOpenCvCoordinatesRef.current ? 1 : -1;
+        if (keys.forward) controls.moveForward(forwardSign * step);
+        if (keys.backward) controls.moveForward(-forwardSign * step);
         if (keys.right) controls.moveRight(step);
         if (keys.left) controls.moveRight(-step);
       }
@@ -317,7 +325,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
       cameraRef.current = null;
       cameraPosesRef.current = [];
     };
-  }, [sceneUrl, isV3]);
+  }, [sceneUrl]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>

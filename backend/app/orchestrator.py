@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -15,6 +16,24 @@ from app.storage import S3Storage, get_storage
 
 logger = logging.getLogger(__name__)
 SCRATCH_DIR = Path(settings.storage_local_path).parent / "scratch"
+
+
+def _validate_viewer_artifacts(job: Job, storage) -> None:
+    """Reject incomplete GPU output before a user enters a broken viewer."""
+    if not job.output_storage_key or not storage.exists(job.output_storage_key):
+        raise RuntimeError("Reconstruction completed without scene.ply")
+    if not job.camera_storage_key or not storage.exists(job.camera_storage_key):
+        raise RuntimeError("Reconstruction completed without camera metadata")
+    try:
+        metadata = json.loads(storage.read(job.camera_storage_key))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RuntimeError("Reconstruction produced invalid camera metadata") from error
+    if metadata.get("coordinate_convention") not in {"opencv", "opengl"}:
+        raise RuntimeError("Camera metadata is missing its coordinate convention")
+    frames = metadata.get("frames")
+    matrices = metadata.get("camera_to_world_matrices")
+    if not (isinstance(frames, list) and frames) and not (isinstance(matrices, list) and matrices):
+        raise RuntimeError("Camera metadata contains no training poses")
 
 
 async def _set(job, session, status: JobStatus, progress: int, detail: str) -> None:
@@ -118,6 +137,7 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
                 await _run_runpod(job, session, storage, frame_keys)
             else:
                 raise RuntimeError(f"Unknown GPU_BACKEND={settings.gpu_backend!r}")
+            _validate_viewer_artifacts(job, storage)
             await _set(job, session, JobStatus.COMPLETE, 100, "Ready to explore")
         except Exception as exc:
             logger.exception("Pipeline failed for job %s", job_id)
