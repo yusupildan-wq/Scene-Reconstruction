@@ -76,20 +76,48 @@ class RunPodExecutor:
         """Best-effort cleanup used when the local backend resumes after a crash."""
         self._terminate(pod_id)
 
+    # RunPod's `desiredStatus` reports what the pod is meant to be doing, not
+    # whether its container has actually finished starting: it stays RUNNING for
+    # the whole scheduling + image-pull + boot sequence, and only flips to one of
+    # these two once the pod has actually died. That makes it the signal for a
+    # real provisioning failure, distinct from a pod that is still legitimately
+    # pulling a multi-gigabyte CUDA image.
+    _FAILED_POD_STATUSES = {"EXITED", "TERMINATED"}
+
     def _wait_for_ssh(self, pod_id: str, private_key: Path, known_hosts: Path, report: ProgressReporter) -> tuple[str, int]:
-        deadline = time.monotonic() + settings.runpod_startup_timeout_seconds
-        while time.monotonic() < deadline:
+        provisioning_deadline = time.monotonic() + settings.runpod_startup_timeout_seconds
+        ssh_deadline: float | None = None
+        network_ready = False
+        while True:
+            now = time.monotonic()
+            if not network_ready and now >= provisioning_deadline:
+                raise TimeoutError(
+                    "RunPod pod did not finish provisioning (scheduling or image pull) within "
+                    f"{settings.runpod_startup_timeout_seconds}s"
+                )
+            if network_ready and now >= ssh_deadline:
+                raise TimeoutError(
+                    "RunPod pod network became reachable but SSH never came up within "
+                    f"{settings.runpod_ssh_ready_timeout_seconds}s; the pod likely failed to start correctly"
+                )
             pod = self._get_pod(pod_id)
+            status = pod.get("desiredStatus")
+            if status in self._FAILED_POD_STATUSES:
+                raise RuntimeError(f"RunPod pod exited during startup (status={status}) before it became reachable")
             ip = pod.get("publicIp")
             mappings = pod.get("portMappings") or {}
             port = mappings.get("22") or mappings.get(22)
             if ip and port:
+                if not network_ready:
+                    network_ready = True
+                    ssh_deadline = time.monotonic() + settings.runpod_ssh_ready_timeout_seconds
                 command = self._ssh_base(str(ip), int(port), private_key, known_hosts) + ["true"]
                 if subprocess.run(command, capture_output=True, timeout=20).returncode == 0:
                     return str(ip), int(port)
-            report("vggt_geometry", 32, "Waiting for temporary RunPod GPU")
+                report("vggt_geometry", 32, "Pod network is up; waiting for SSH to come online")
+            else:
+                report("vggt_geometry", 32, "Waiting for temporary RunPod GPU to finish provisioning (image download can take a while)")
             time.sleep(5)
-        raise TimeoutError("RunPod did not become reachable before the startup timeout")
 
     @staticmethod
     def _ssh_base(host: str, port: int, key: Path, known_hosts: Path) -> list[str]:

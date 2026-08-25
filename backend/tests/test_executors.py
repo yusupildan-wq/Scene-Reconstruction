@@ -4,9 +4,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.config import settings
 from app.executors.base import ExecutionRequest, ProviderCapability
 from app.executors.local_nvidia import LocalNvidiaExecutor
 from app.executors.runpod_pod import RunPodExecutor
+
+
+class _FakeClock:
+    """Deterministic stand-in for time.monotonic/time.sleep so wait-loop tests run instantly."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 class ExecutorTests(unittest.TestCase):
@@ -50,6 +64,59 @@ class ExecutorTests(unittest.TestCase):
                     executor.execute(request, lambda *_: None)
                 self.assertIn("execute_v3_workspace.py", run_remote.call_args.args[0][-1])
                 terminate.assert_called_once_with("pod-1")
+
+    def test_runpod_wait_for_ssh_fails_fast_when_pod_exits(self):
+        """A pod RunPod itself reports as EXITED/TERMINATED is a real failure, not a slow cold start."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        with patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", return_value={"desiredStatus": "EXITED"}) as get_pod:
+            with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
+        get_pod.assert_called_once()
+        self.assertEqual(clock.now, 0.0)
+
+    def test_runpod_wait_for_ssh_times_out_while_image_still_pulling(self):
+        """No publicIp/portMappings yet and status still RUNNING means a legitimate slow image pull, not a stall."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        pod = {"desiredStatus": "RUNNING", "publicIp": None, "portMappings": {}}
+        with patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", return_value=pod), \
+             patch.object(settings, "runpod_startup_timeout_seconds", 12):
+            with self.assertRaisesRegex(TimeoutError, "provisioning \\(scheduling or image pull\\)"):
+                executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
+
+    def test_runpod_wait_for_ssh_times_out_when_ssh_never_comes_up(self):
+        """publicIp/portMappings present (container network is up) but sshd never answers is a real stall, not a pull."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        pod = {"desiredStatus": "RUNNING", "publicIp": "1.2.3.4", "portMappings": {"22": 2222}}
+        with patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", return_value=pod), \
+             patch.object(settings, "runpod_ssh_ready_timeout_seconds", 12), \
+             patch("app.executors.runpod_pod.subprocess.run", return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(TimeoutError, "SSH never came up"):
+                executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
+
+    def test_runpod_wait_for_ssh_survives_a_slow_image_pull_then_connects(self):
+        """A pod that stays RUNNING with no network for a while and then comes up should succeed, not time out."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        pods = [
+            {"desiredStatus": "RUNNING", "publicIp": None, "portMappings": {}},
+            {"desiredStatus": "RUNNING", "publicIp": None, "portMappings": {}},
+            {"desiredStatus": "RUNNING", "publicIp": "1.2.3.4", "portMappings": {"22": 2222}},
+        ]
+        with patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", side_effect=pods), \
+             patch("app.executors.runpod_pod.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+            host, port = executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
+        self.assertEqual((host, port), ("1.2.3.4", 2222))
 
     def test_runpod_create_uses_rest_pod_image_and_direct_ssh(self):
         executor = RunPodExecutor()
