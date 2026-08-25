@@ -86,6 +86,10 @@ async def retry_job(job_id: uuid.UUID, background_tasks: BackgroundTasks,
         raise HTTPException(status_code=409, detail="Only failed jobs can be retried")
     job.status, job.error_message, job.stage_detail = JobStatus.PENDING, None, "Retrying from saved artifacts"
     job.runpod_job_id = None
+    # progress_percent only ever moves forward within a run (see orchestrator._set's
+    # max()), so a failed attempt's high-water mark must be cleared here or it leaks
+    # into the retry's UI as a stale percentage that doesn't match the resumed stage.
+    job.progress_percent = 0
     await session.commit()
     background_tasks.add_task(run_pipeline, job.id)
     return job_out(job)

@@ -118,6 +118,29 @@ class ExecutorTests(unittest.TestCase):
             host, port = executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
         self.assertEqual((host, port), ("1.2.3.4", 2222))
 
+    def test_runpod_does_not_report_finalizing_progress_on_failure(self):
+        """A failed run must not fabricate 'finalizing'/99% progress: orchestrator._set never
+        lets progress_percent decrease within a run, so a false 99% here would stick around as
+        a stale high-water mark and leak into a later retry's progress bar."""
+        executor = RunPodExecutor()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scene = root / "scene"
+            (scene / "images").mkdir(parents=True)
+            (scene / "images" / "frame.jpg").write_bytes(b"frame")
+            request = ExecutionRequest("job-id", scene, root / "result", "baseline")
+            reports: list[tuple[str, int, str]] = []
+            with patch.object(executor, "validate", return_value=ProviderCapability(True, "ready")), \
+                 patch.object(executor, "_ensure_key", return_value=(root / "key", "ssh-ed25519 test")), \
+                 patch.object(executor, "_create_pod", return_value={"id": "pod-1"}), \
+                 patch.object(executor, "_wait_for_ssh", side_effect=TimeoutError("RunPod did not become reachable")), \
+                 patch("app.executors.runpod_pod.subprocess.run"), \
+                 patch.object(executor, "_terminate") as terminate:
+                with self.assertRaises(TimeoutError):
+                    executor.execute(request, lambda stage, pct, detail: reports.append((stage, pct, detail)))
+            terminate.assert_called_once_with("pod-1")
+            self.assertFalse(any(stage == "finalizing" for stage, _, _ in reports))
+
     def test_runpod_create_uses_rest_pod_image_and_direct_ssh(self):
         executor = RunPodExecutor()
         response = SimpleNamespace(ok=True, json=lambda: {"id": "pod-1"}, text="")

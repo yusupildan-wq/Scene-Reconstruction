@@ -22,6 +22,7 @@ test -w "$WORKSPACE_ROOT"
 nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader
 touch "$STATE_ROOT/01_runtime.ok"
 
+"$PROJECT_ROOT/bootstrap/wait_for_cuda.sh" "$VGGT_PYTHON"
 "$VGGT_PYTHON" -c 'import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
 touch "$STATE_ROOT/02_torch.ok"
 

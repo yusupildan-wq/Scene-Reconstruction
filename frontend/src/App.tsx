@@ -148,7 +148,11 @@ export default function App() {
         {job?.status !== "failed" && <><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><b className="percent">{progress}%</b>
           <ol className="stages">{STAGES.map(([key, label], i) => <li key={key} className={i < currentIndex ? "done" : i === currentIndex ? "active" : ""}>
             <span>{i < currentIndex ? "✓" : i + 1}</span><em>{label}</em></li>)}</ol></>}
-        {job?.status === "failed" && <button className="primary" onClick={retry}>Retry from saved progress</button>}
+        {job?.status === "failed" && <>
+          <button className="primary" onClick={retry}>Retry from saved progress</button>
+          <button onClick={reset} style={{ width: "100%", marginTop: 10, padding: "14px 20px", borderRadius: 11,
+            background: "transparent", border: "1px solid #303735", color: "#b8c2bf", fontWeight: 650 }}>Back to home</button>
+        </>}
       </div>}
       {(error || job?.error_message) && <div className="error">{error || job?.error_message}</div>}
     </section>

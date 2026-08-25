@@ -141,6 +141,7 @@ class RunPodExecutor:
             archive.add(request.scene_dir, arcname="scene")
 
         pod_id: str | None = None
+        succeeded = False
         try:
             report("vggt_geometry", 30, "Provisioning temporary RunPod GPU")
             pod = self._create_pod(public_key, request.job_id)
@@ -189,6 +190,7 @@ class RunPodExecutor:
             request.result_dir.mkdir(parents=True, exist_ok=True)
             with tarfile.open(output_archive, "r:gz") as archive:
                 archive.extractall(request.result_dir)
+            succeeded = True
             return ExecutionResult(
                 request.result_dir / "scene.ply", request.result_dir / "scene_cameras.json",
                 request.result_dir / "vggt_geometry.tar.gz", request.result_dir / "metrics.json", pod_id,
@@ -196,7 +198,12 @@ class RunPodExecutor:
         finally:
             if pod_id:
                 try:
-                    report("finalizing", 99, "Terminating temporary RunPod GPU")
+                    # Only claim "finalizing"/99% once the run actually reached that
+                    # point. Reporting it unconditionally here (including on early
+                    # failures, e.g. an SSH-readiness timeout) fabricated progress
+                    # that then stuck around as a stale high-water mark for a retry.
+                    if succeeded:
+                        report("finalizing", 99, "Terminating temporary RunPod GPU")
                     self._terminate(pod_id)
                 except Exception as cleanup_error:
                     raise RuntimeError(f"RunPod cleanup failed for pod {pod_id}: {cleanup_error}") from cleanup_error
