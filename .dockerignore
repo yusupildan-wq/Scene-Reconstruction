@@ -8,5 +8,6 @@ frontend/public/*.ply
 frontend/vite*.log
 experiments/artifacts
 backend/data
+**/.env
 *.mov
 *.mp4

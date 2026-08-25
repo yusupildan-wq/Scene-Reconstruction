@@ -52,6 +52,7 @@ class Job(Base):
     output_storage_key: Mapped[str | None] = mapped_column(String(1024), default=None)
     camera_storage_key: Mapped[str | None] = mapped_column(String(1024), default=None)
     runpod_job_id: Mapped[str | None] = mapped_column(String(255), default=None)
+    execution_mode: Mapped[str] = mapped_column(String(32), default="runpod")
     progress_percent: Mapped[int] = mapped_column(Integer, default=0)
     stage_artifacts: Mapped[dict] = mapped_column(JSONB, default=dict)
 

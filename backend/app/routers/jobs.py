@@ -1,6 +1,7 @@
+import asyncio
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +10,9 @@ from app.db import get_session
 from app.models import Job, JobStatus, Project
 from app.orchestrator import run_pipeline
 from app.schemas import JobOut
+from app.schemas import ComputeCapabilitiesOut
 from app.storage import LocalStorage, get_storage
+from app.executors import LocalNvidiaExecutor, RunPodExecutor
 
 router = APIRouter(tags=["jobs"])
 
@@ -25,13 +28,20 @@ def job_out(job: Job) -> JobOut:
 
 @router.post("/projects/{project_id}/jobs", response_model=JobOut, status_code=201)
 async def create_job(project_id: uuid.UUID, video: UploadFile, background_tasks: BackgroundTasks,
+                     execution_mode: str = Form("runpod"),
                      session: AsyncSession = Depends(get_session)):
     if await session.get(Project, project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found")
     if not video.filename or not (video.content_type or "").startswith("video/"):
         raise HTTPException(status_code=415, detail="Please upload a video file")
+    if execution_mode not in {"local_nvidia", "runpod"}:
+        raise HTTPException(status_code=422, detail="execution_mode must be local_nvidia or runpod")
+    provider = LocalNvidiaExecutor() if execution_mode == "local_nvidia" else RunPodExecutor()
+    capability = await asyncio.to_thread(provider.validate)
+    if not capability.available:
+        raise HTTPException(status_code=422, detail=capability.detail)
     job = Job(project_id=project_id, status=JobStatus.PENDING, input_storage_key="",
-              progress_percent=0, stage_detail="Upload received", stage_artifacts={})
+              execution_mode=execution_mode, progress_percent=0, stage_detail="Upload received", stage_artifacts={})
     session.add(job)
     await session.flush()
     key = f"projects/{project_id}/jobs/{job.id}/input.mp4"
@@ -42,6 +52,15 @@ async def create_job(project_id: uuid.UUID, video: UploadFile, background_tasks:
     await session.refresh(job)
     background_tasks.add_task(run_pipeline, job.id)
     return job_out(job)
+
+
+@router.get("/compute/capabilities", response_model=ComputeCapabilitiesOut)
+async def compute_capabilities():
+    local, runpod = await asyncio.gather(
+        asyncio.to_thread(LocalNvidiaExecutor().validate),
+        asyncio.to_thread(RunPodExecutor().validate),
+    )
+    return {"local_nvidia": local, "runpod": runpod}
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)

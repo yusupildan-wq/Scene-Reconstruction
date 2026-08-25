@@ -1,5 +1,5 @@
 import { DragEvent, useCallback, useEffect, useRef, useState } from "react";
-import { API_BASE_URL, createJob, createProject, getJob, Job, listProjects, retryJob } from "./api/client";
+import { API_BASE_URL, ComputeCapabilities, createJob, createProject, getComputeCapabilities, getJob, Job, listProjects, retryJob } from "./api/client";
 import GaussianSplatViewer from "./GaussianSplatViewer";
 import SceneViewer from "./SceneViewer";
 import "./styles.css";
@@ -28,9 +28,17 @@ export default function App() {
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
   const [viewerLoaded, setViewerLoaded] = useState(false);
   const [experimentScene, setExperimentScene] = useState("v3_scene_high.ply");
+  const [executionMode, setExecutionMode] = useState<"local_nvidia" | "runpod">("runpod");
+  const [capabilities, setCapabilities] = useState<ComputeCapabilities | null>(null);
   const handleViewerLoaded = useCallback(() => setViewerLoaded(true), []);
 
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+  useEffect(() => {
+    getComputeCapabilities().then((next) => {
+      setCapabilities(next);
+      setExecutionMode(next.local_nvidia.available ? "local_nvidia" : "runpod");
+    }).catch(() => setCapabilities(null));
+  }, []);
   useEffect(() => {
     const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
     if (!savedJobId) return;
@@ -67,7 +75,7 @@ export default function App() {
     try {
       const projects = await listProjects();
       const project = projects[0] ?? await createProject("My room reconstructions");
-      const created = await createJob(project.id, file, setUploadPercent);
+      const created = await createJob(project.id, file, executionMode, setUploadPercent);
       setJob(created); localStorage.setItem(ACTIVE_JOB_KEY, created.id); setUploadPercent(100);
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setUploading(false); }
@@ -114,13 +122,28 @@ export default function App() {
         </div>
         {preview && file && <div className="preview"><video src={preview} controls preload="metadata" />
           <div><strong>{file.name}</strong><span>{(file.size / 1048576).toFixed(1)} MB</span></div></div>}
-        {file && <button className="primary" onClick={submit}>Reconstruct room</button>}
+        <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {(["local_nvidia", "runpod"] as const).map((mode) => {
+            const capability = capabilities?.[mode];
+            const unavailable = capability ? !capability.available : false;
+            return <button key={mode} type="button" disabled={unavailable} onClick={() => setExecutionMode(mode)}
+              style={{ textAlign: "left", padding: 14, borderRadius: 11, color: unavailable ? "#65706d" : "#e8eeec",
+                background: executionMode === mode ? "#17352b" : "#121716",
+                border: `1px solid ${executionMode === mode ? "#6fe0b2" : "#303735"}`, cursor: unavailable ? "not-allowed" : "pointer" }}>
+              <strong style={{ display: "block", marginBottom: 5 }}>{mode === "local_nvidia" ? "Local NVIDIA GPU" : "RunPod"}</strong>
+              <span style={{ fontSize: 12, lineHeight: 1.35, color: "#899391" }}>{capability?.detail ?? "Checking availability…"}</span>
+            </button>;
+          })}
+        </div>
+        {capabilities && !capabilities.local_nvidia.available && <p style={{ marginTop: 10, fontSize: 13 }}>Local CUDA is unavailable, so RunPod is recommended.</p>}
+        {file && <button className="primary" disabled={capabilities ? !capabilities[executionMode].available : true} onClick={submit}>Reconstruct room</button>}
       </>}
 
       {(processing || job) && <div className="progress-view">
         <div className="spinner-or-check">{job?.status === "failed" ? "!" : "◌"}</div>
         <span className="eyebrow">{job?.status === "failed" ? "RECONSTRUCTION PAUSED" : "BUILDING YOUR SCENE"}</span>
         <h2>{job?.status === "failed" ? "Something interrupted the reconstruction" : job?.stage_detail || "Uploading your video"}</h2>
+        {job && <p style={{ marginBottom: 8 }}>Compute: {job.execution_mode === "local_nvidia" ? "Local NVIDIA GPU" : "Temporary RunPod GPU"}</p>}
         <p>{job?.status === "failed" ? "Your completed work is saved. Retry continues from the last reusable stage." : "You can leave this tab open while we turn the video into a navigable room."}</p>
         {job?.status !== "failed" && <><div className="progress-track"><i style={{ width: `${progress}%` }} /></div><b className="percent">{progress}%</b>
           <ol className="stages">{STAGES.map(([key, label], i) => <li key={key} className={i < currentIndex ? "done" : i === currentIndex ? "active" : ""}>

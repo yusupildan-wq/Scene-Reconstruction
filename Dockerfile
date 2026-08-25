@@ -37,7 +37,6 @@ RUN git clone https://github.com/facebookresearch/vggt.git /opt/vggt && \
 
 COPY bootstrap/requirements-vggt.txt /opt/bootstrap/requirements-vggt.txt
 COPY bootstrap/requirements-gsplat.txt /opt/bootstrap/requirements-gsplat.txt
-COPY bootstrap/requirements-serverless.txt /opt/bootstrap/requirements-serverless.txt
 
 RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
     /opt/venvs/vggt/bin/pip install -r /opt/bootstrap/requirements-vggt.txt && \
@@ -46,8 +45,6 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
     /opt/venvs/gsplat/bin/pip install -r /opt/bootstrap/requirements-gsplat.txt && \
     /opt/venvs/gsplat/bin/pip install --no-deps \
       "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl"
-
-RUN python3.10 -m pip install -r /opt/bootstrap/requirements-serverless.txt
 
 COPY . /opt/project
 RUN chmod +x /opt/project/bootstrap/*.sh

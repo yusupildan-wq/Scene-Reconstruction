@@ -31,8 +31,20 @@ class JobOut(BaseModel):
     output_storage_key: str | None
     camera_storage_key: str | None
     progress_percent: int
+    execution_mode: str
     scene_url: str | None = None
     cameras_url: str | None = None
     metrics: dict | None
     created_at: datetime
     updated_at: datetime
+
+
+class ProviderCapabilityOut(BaseModel):
+    available: bool
+    detail: str
+    vram_gb: float | None = None
+
+
+class ComputeCapabilitiesOut(BaseModel):
+    local_nvidia: ProviderCapabilityOut
+    runpod: ProviderCapabilityOut

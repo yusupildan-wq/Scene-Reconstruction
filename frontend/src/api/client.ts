@@ -7,9 +7,12 @@ export interface Job {
   id: string; project_id: string; status: JobStatus; stage_detail: string | null;
   error_message: string | null; frame_count: number | null; selected_frame_count: number | null;
   output_storage_key: string | null; camera_storage_key: string | null; progress_percent: number;
+  execution_mode: "local_nvidia" | "runpod";
   scene_url: string | null; cameras_url: string | null; metrics: Record<string, unknown> | null;
   created_at: string; updated_at: string;
 }
+export interface ProviderCapability { available: boolean; detail: string; vram_gb: number | null; }
+export interface ComputeCapabilities { local_nvidia: ProviderCapability; runpod: ProviderCapability; }
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, init);
   if (!response.ok) {
@@ -24,8 +27,9 @@ export const createProject = (name: string) => request<Project>("/projects", {
   method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
 });
 export const getJob = (id: string) => request<Job>(`/jobs/${id}`);
+export const getComputeCapabilities = () => request<ComputeCapabilities>("/compute/capabilities");
 export const retryJob = (id: string) => request<Job>(`/jobs/${id}/retry`, { method: "POST" });
-export function createJob(projectId: string, video: File, onProgress: (percent: number) => void): Promise<Job> {
+export function createJob(projectId: string, video: File, executionMode: "local_nvidia" | "runpod", onProgress: (percent: number) => void): Promise<Job> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${API_BASE_URL}/projects/${projectId}/jobs`);
@@ -34,6 +38,6 @@ export function createJob(projectId: string, video: File, onProgress: (percent: 
     xhr.onload = () => xhr.status >= 200 && xhr.status < 300
       ? resolve(JSON.parse(xhr.responseText) as Job)
       : reject(new Error((() => { try { return JSON.parse(xhr.responseText).detail; } catch { return xhr.responseText; } })() || `Upload failed (${xhr.status})`));
-    const form = new FormData(); form.append("video", video); xhr.send(form);
+    const form = new FormData(); form.append("video", video); form.append("execution_mode", executionMode); xhr.send(form);
   });
 }

@@ -23,14 +23,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://scene:scene@postgres:5432/scene
       STORAGE_BACKEND: local
       STORAGE_LOCAL_PATH: /data/storage
-      GPU_BACKEND: local
-      LOCAL_DEMO_SCENE_PLY: /demo/v3_scene.ply
-      LOCAL_DEMO_CAMERAS_JSON: /demo/v3_scene_cameras.json
+      SSH_PRIVATE_KEY_PATH: /data/runpod_ed25519
+    env_file:
+      - ../backend/.env
     volumes:
       - ../backend/app:/app/app
       - ../backend/alembic:/app/alembic
-      - backend_storage:/data/storage
-      - ../frontend/public:/demo:ro
+      - ../backend/data:/data
     ports:
       - "8000:8000"
     depends_on:
@@ -52,4 +51,3 @@ services:
 
 volumes:
   postgres_data:
-  backend_storage:

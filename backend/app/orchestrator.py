@@ -1,40 +1,28 @@
-"""Resumable CPU/GPU reconstruction orchestration."""
+"""Resumable orchestration with provider-independent local artifacts."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import shutil
+import tarfile
 import uuid
 from pathlib import Path
 
-from app.config import settings
-from app.db import SessionLocal
-from app.dispatch import get_gpu_job, submit_gpu_job
-from app.models import Job, JobStatus
-from app.pipeline import extract_frames
-from app.storage import S3Storage, get_storage
 from sqlalchemy import select
 
+from app.config import settings
+from app.db import SessionLocal
+from app.executors import ExecutionRequest, LocalNvidiaExecutor, RunPodExecutor
+from app.models import Job, JobStatus
+from app.pipeline import extract_frames
+from app.storage import get_storage
+
 logger = logging.getLogger(__name__)
-SCRATCH_DIR = Path(settings.storage_local_path).parent / "scratch"
-WORKER_URL_TTL_SECONDS = 24 * 60 * 60
-
-
-def _runpod_progress(result: dict) -> dict:
-    """Normalize RunPod's progress field across SDK/API response variants."""
-    value = result.get("progress")
-    if isinstance(value, list):
-        value = value[-1] if value else None
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-    return value if isinstance(value, dict) else {}
+SCRATCH_DIR = Path(settings.storage_local_path).resolve().parent / "scratch"
 
 
 def _validate_viewer_artifacts(job: Job, storage) -> None:
-    """Reject incomplete GPU output before a user enters a broken viewer."""
     if not job.output_storage_key or not storage.exists(job.output_storage_key):
         raise RuntimeError("Reconstruction completed without scene.ply")
     if not job.camera_storage_key or not storage.exists(job.camera_storage_key):
@@ -45,13 +33,11 @@ def _validate_viewer_artifacts(job: Job, storage) -> None:
         raise RuntimeError("Reconstruction produced invalid camera metadata") from error
     if metadata.get("coordinate_convention") not in {"opencv", "opengl"}:
         raise RuntimeError("Camera metadata is missing its coordinate convention")
-    frames = metadata.get("frames")
-    matrices = metadata.get("camera_to_world_matrices")
-    if not (isinstance(frames, list) and frames) and not (isinstance(matrices, list) and matrices):
+    if not metadata.get("frames") and not metadata.get("camera_to_world_matrices"):
         raise RuntimeError("Camera metadata contains no training poses")
 
 
-async def _set(job, session, status: JobStatus, progress: int, detail: str) -> None:
+async def _set(job: Job, session, status: JobStatus, progress: int, detail: str) -> None:
     job.status = status
     job.progress_percent = max(job.progress_percent or 0, min(100, progress))
     job.stage_detail = detail
@@ -59,26 +45,25 @@ async def _set(job, session, status: JobStatus, progress: int, detail: str) -> N
     await session.commit()
 
 
-async def _prepare_frames(job, session, storage) -> list[str]:
+async def _prepare_frames(job: Job, session, storage) -> list[str]:
     artifacts = dict(job.stage_artifacts or {})
     frame_keys = artifacts.get("frame_keys", [])
     if frame_keys and all(storage.exists(key) for key in frame_keys):
         await _set(job, session, JobStatus.PREPARING_FRAMES, 25, "Reusing prepared frames")
         return frame_keys
     await _set(job, session, JobStatus.PREPARING_FRAMES, 10, "Selecting sharp, useful frames")
-    scratch = SCRATCH_DIR / str(job.id)
+    scratch = SCRATCH_DIR / str(job.id) / "preprocessing"
     scratch.mkdir(parents=True, exist_ok=True)
     video_path = scratch / "input.mp4"
     video_path.write_bytes(storage.read(job.input_storage_key))
     result = await asyncio.to_thread(extract_frames, video_path, scratch / "frames")
     if result.selected_frame_count < 2:
-        raise RuntimeError(
-            "The video did not contain enough sharp frames. Record a slower pass with the room well lit."
-        )
+        raise RuntimeError("The video did not contain enough sharp frames. Record a slower pass with the room well lit.")
     frame_keys = []
     for frame_path in result.frame_paths:
         key = f"projects/{job.project_id}/jobs/{job.id}/frames/{frame_path.name}"
-        storage.save(key, frame_path.read_bytes())
+        with frame_path.open("rb") as source:
+            storage.save_fileobj(key, source)
         frame_keys.append(key)
     job.frame_count, job.selected_frame_count = result.total_frames_seen, result.selected_frame_count
     artifacts["frame_keys"] = frame_keys
@@ -87,76 +72,86 @@ async def _prepare_frames(job, session, storage) -> list[str]:
     return frame_keys
 
 
-async def _run_local_demo(job, session, storage) -> None:
-    """No-cost full-flow adapter using the existing V3 result, never a GPU."""
-    await _set(job, session, JobStatus.VGGT_GEOMETRY, 42, "Estimating cameras and room geometry")
-    await asyncio.sleep(0.8)
-    await _set(job, session, JobStatus.GAUSSIAN_OPTIMIZATION, 68, "Optimizing Gaussian appearance")
-    await asyncio.sleep(0.8)
-    source_ply = Path(settings.local_demo_scene_ply).resolve()
-    source_cameras = Path(settings.local_demo_cameras_json).resolve()
-    if not source_ply.is_file():
-        raise RuntimeError(
-            f"Local demo artifact not found at {source_ply}. Set LOCAL_DEMO_SCENE_PLY, "
-            "or configure GPU_BACKEND=runpod for real reconstruction."
-        )
-    await _set(job, session, JobStatus.FINALIZING, 92, "Packaging viewer artifacts")
-    storage.save(job.output_storage_key, source_ply.read_bytes())
-    if source_cameras.is_file():
-        storage.save(job.camera_storage_key, source_cameras.read_bytes())
-
-
-async def _run_runpod(job, session, storage: S3Storage, frame_keys: list[str]) -> None:
-    if not isinstance(storage, S3Storage):
-        raise RuntimeError("GPU_BACKEND=runpod requires STORAGE_BACKEND=s3")
-    if storage.exists(job.output_storage_key) and storage.exists(job.camera_storage_key):
-        await _set(job, session, JobStatus.FINALIZING, 96, "Reusing completed viewer artifacts")
+def _restore_geometry(storage, key: str | None, scene_dir: Path) -> None:
+    if not key or not storage.exists(key):
         return
+    archive_path = scene_dir.parent / "saved_geometry.tar.gz"
+    archive_path.write_bytes(storage.read(key))
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(scene_dir)
+
+
+def _workspace(job: Job, storage, frame_keys: list[str]) -> tuple[Path, Path]:
+    root = SCRATCH_DIR / str(job.id) / "reconstruction"
+    scene_dir, result_dir = root / "scene", root / "result"
+    images_dir = scene_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    for index, key in enumerate(frame_keys):
+        (images_dir / f"frame_{index:06d}.jpg").write_bytes(storage.read(key))
+    _restore_geometry(storage, (job.stage_artifacts or {}).get("geometry_key"), scene_dir)
+    return scene_dir, result_dir
+
+
+async def _execute(job: Job, session, storage, frame_keys: list[str]):
+    if storage.exists(job.output_storage_key) and storage.exists(job.camera_storage_key):
+        await _set(job, session, JobStatus.FINALIZING, 98, "Reusing completed local artifacts")
+        return
+    scene_dir, result_dir = await asyncio.to_thread(_workspace, job, storage, frame_keys)
+    loop = asyncio.get_running_loop()
+
+    def report(stage: str, progress: int, detail: str) -> None:
+        status = {
+            "vggt_geometry": JobStatus.VGGT_GEOMETRY,
+            "gaussian_optimization": JobStatus.GAUSSIAN_OPTIMIZATION,
+            "finalizing": JobStatus.FINALIZING,
+        }.get(stage, JobStatus.VGGT_GEOMETRY)
+        asyncio.run_coroutine_threadsafe(_set(job, session, status, progress, detail), loop).result()
+
+    def remember_pod(pod_id: str) -> None:
+        async def save() -> None:
+            job.runpod_job_id = pod_id
+            await session.commit()
+        asyncio.run_coroutine_threadsafe(save(), loop).result()
+
+    executor = LocalNvidiaExecutor() if job.execution_mode == "local_nvidia" else RunPodExecutor(remember_pod)
+    if job.execution_mode == "runpod" and job.runpod_job_id:
+        try:
+            await asyncio.to_thread(executor.terminate_existing, job.runpod_job_id)
+        except Exception:
+            logger.warning("Could not clean up previous pod %s", job.runpod_job_id, exc_info=True)
+        job.runpod_job_id = None
+        await session.commit()
+    try:
+        result = await asyncio.to_thread(executor.execute, ExecutionRequest(
+            str(job.id), scene_dir, result_dir, settings.reconstruction_quality_profile,
+        ), report)
+    except Exception:
+        geometry = result_dir / "vggt_geometry.tar.gz"
+        if not geometry.is_file() and (scene_dir / "sparse").is_dir():
+            result_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(geometry, "w:gz") as archive:
+                archive.add(scene_dir / "sparse", arcname="sparse")
+        if geometry.is_file():
+            geometry_key = f"projects/{job.project_id}/jobs/{job.id}/output/vggt_geometry.tar.gz"
+            with geometry.open("rb") as source:
+                storage.save_fileobj(geometry_key, source)
+            artifacts = dict(job.stage_artifacts or {})
+            artifacts["geometry_key"] = geometry_key
+            job.stage_artifacts = artifacts
+            await session.commit()
+        raise
+    for path, key in ((result.scene_ply, job.output_storage_key), (result.cameras_json, job.camera_storage_key)):
+        with path.open("rb") as source:
+            storage.save_fileobj(key, source)
+    geometry_key = f"projects/{job.project_id}/jobs/{job.id}/output/vggt_geometry.tar.gz"
+    with result.geometry_archive.open("rb") as source:
+        storage.save_fileobj(geometry_key, source)
     artifacts = dict(job.stage_artifacts or {})
-    geometry_key = artifacts.get("geometry_key") or (
-        f"projects/{job.project_id}/jobs/{job.id}/output/vggt_geometry.tar.gz"
-    )
     artifacts["geometry_key"] = geometry_key
     job.stage_artifacts = artifacts
+    job.metrics = json.loads(result.metrics_json.read_text(encoding="utf-8"))
+    job.runpod_job_id = result.provider_job_id or job.runpod_job_id
     await session.commit()
-    if not job.runpod_job_id:
-        await _set(job, session, JobStatus.VGGT_GEOMETRY, 32, "Queued on GPU")
-        payload = {
-            "job_id": str(job.id),
-            "frame_urls": [storage.url_for(key, WORKER_URL_TTL_SECONDS) for key in frame_keys],
-            "scene_upload_url": storage.upload_url_for(job.output_storage_key),
-            "cameras_upload_url": storage.upload_url_for(job.camera_storage_key),
-            "geometry_upload_url": storage.upload_url_for(geometry_key),
-            "quality_profile": settings.reconstruction_quality_profile,
-        }
-        if storage.exists(geometry_key):
-            payload["geometry_download_url"] = storage.url_for(geometry_key, WORKER_URL_TTL_SECONDS)
-        job.runpod_job_id = await asyncio.to_thread(submit_gpu_job, payload)
-        await session.commit()
-    while True:
-        result = await asyncio.to_thread(get_gpu_job, job.runpod_job_id)
-        state = result.get("status")
-        output = result.get("output") if isinstance(result.get("output"), dict) else {}
-        update = _runpod_progress(result) or output
-        stage = update.get("stage")
-        detail = update.get("detail")
-        progress = int(update.get("progress", 0) or 0)
-        if stage == "gaussian_optimization":
-            await _set(job, session, JobStatus.GAUSSIAN_OPTIMIZATION, progress or 65, detail or "Optimizing Gaussian appearance")
-        elif stage == "finalizing":
-            await _set(job, session, JobStatus.FINALIZING, progress or 92, detail or "Packaging viewer artifacts")
-        elif state in {"IN_QUEUE", "IN_PROGRESS"}:
-            await _set(job, session, JobStatus.VGGT_GEOMETRY, progress or 38, detail or "Estimating cameras and room geometry")
-        if state == "COMPLETED":
-            if output.get("error"):
-                raise RuntimeError(str(output["error"]))
-            if isinstance(output.get("metrics"), dict):
-                job.metrics = output["metrics"]
-                await session.commit()
-            return
-        if state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
-            raise RuntimeError(result.get("error") or f"GPU job ended with {state}")
-        await asyncio.sleep(settings.runpod_poll_seconds)
 
 
 async def run_pipeline(job_id: uuid.UUID) -> None:
@@ -166,16 +161,13 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
             return
         try:
             storage = get_storage()
+            if settings.storage_backend != "local":
+                raise RuntimeError("This application keeps permanent artifacts locally; set STORAGE_BACKEND=local")
             base = f"projects/{job.project_id}/jobs/{job.id}/output"
             job.output_storage_key = job.output_storage_key or f"{base}/scene.ply"
             job.camera_storage_key = job.camera_storage_key or f"{base}/scene_cameras.json"
             frame_keys = await _prepare_frames(job, session, storage)
-            if settings.gpu_backend == "local":
-                await _run_local_demo(job, session, storage)
-            elif settings.gpu_backend == "runpod":
-                await _run_runpod(job, session, storage, frame_keys)
-            else:
-                raise RuntimeError(f"Unknown GPU_BACKEND={settings.gpu_backend!r}")
+            await _execute(job, session, storage, frame_keys)
             _validate_viewer_artifacts(job, storage)
             await _set(job, session, JobStatus.COMPLETE, 100, "Ready to explore")
         except Exception as exc:
@@ -186,7 +178,6 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
 
 
 async def recover_active_jobs() -> None:
-    """Resume jobs after an API restart; every stage is artifact-aware."""
     active = [status for status in JobStatus if status not in {JobStatus.COMPLETE, JobStatus.FAILED}]
     async with SessionLocal() as session:
         result = await session.execute(select(Job.id).where(Job.status.in_(active)))

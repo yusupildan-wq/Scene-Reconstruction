@@ -1,35 +1,20 @@
 # Scene Reconstruction
 
-Turn a room video into an interactive 3D Gaussian Splat scene.
+Turn a room video into a local interactive Gaussian Splat scene using the existing V3 VGGT + gsplat pipeline.
 
-## Pipeline
+## Run it
 
-```text
-video upload → frame selection → VGGT geometry → gsplat optimization → WebGL viewer
-```
-
-The React frontend provides upload, preview, progress, retry, and scene viewing. The FastAPI backend stores resumable jobs and artifacts. RunPod is used only for CUDA-required VGGT and gsplat work; development and preprocessing run locally.
-
-## Local development
-
-```bash
+```powershell
+Copy-Item backend/.env.example backend/.env
+# Add your RUNPOD_API_KEY to backend/.env
 docker compose -f infra/docker-compose.yml up --build
 ```
 
-- Frontend: http://localhost:5173
-- API: http://localhost:8000
-- Experiments: http://localhost:5173/?experiments=1
+Open http://localhost:5173, choose a compute mode, and drop in a video. Uploads, frames, geometry, PLYs, camera metadata, and job state remain under `backend/data` and the local PostgreSQL volume.
 
-Local mode uses the existing V3 reconstruction and does not start paid GPU compute.
+## Compute modes
 
-## Repository
+- **RunPod:** provisions a temporary GPU pod, transfers the prepared scene over SSH, runs V3, downloads the results, and terminates the pod automatically. No S3/R2 or Serverless endpoint is required.
+- **Local NVIDIA GPU:** validates the NVIDIA driver, CUDA-enabled PyTorch, VRAM, VGGT, and gsplat before running the exact same workspace command locally. Configure the local paths in `backend/.env` and run the backend natively so it can access the host GPU.
 
-```text
-frontend/     React upload flow and Gaussian viewer
-backend/      FastAPI jobs, storage, and orchestration
-experiments/  V1/V2/V3 reconstruction experiments
-bootstrap/    Pinned GPU environment and verification
-scripts/      Local preparation and RunPod preflight
-```
-
-See [RUNPOD_SETUP.md](RUNPOD_SETUP.md) for GPU execution and [experiments/V3_VGGT.md](experiments/V3_VGGT.md) for the current pipeline.
+RunPod is used only for temporary CUDA compute. See [RUNPOD_SETUP.md](RUNPOD_SETUP.md) for configuration and safety details.

@@ -14,10 +14,9 @@ dependencies = [
     "alembic>=1.13",
     "pydantic-settings>=2.6",
     "python-multipart>=0.0.12",
-    "boto3>=1.35",
     "opencv-python-headless>=4.10",
     "requests>=2.32",
 ]
 
-[tool.setuptools]
-packages = ["app"]
+[tool.setuptools.packages.find]
+include = ["app*"]
