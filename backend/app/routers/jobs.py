@@ -2,16 +2,15 @@ import asyncio
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.models import Job, JobStatus, Project
 from app.orchestrator import run_pipeline
-from app.schemas import JobOut
-from app.schemas import ComputeCapabilitiesOut
-from app.storage import LocalStorage, get_storage
+from app.schemas import ComputeCapabilitiesOut, JobOut
+from app.storage import get_storage
 from app.executors import LocalNvidiaExecutor, RunPodExecutor
 
 router = APIRouter(tags=["jobs"])
@@ -97,17 +96,10 @@ async def _artifact(job_id: uuid.UUID, cameras: bool, session: AsyncSession):
     key = (job.camera_storage_key if cameras else job.output_storage_key) if job else None
     if not key or job.status != JobStatus.COMPLETE:
         raise HTTPException(status_code=404, detail="Artifact is not ready")
-    storage = get_storage()
-    if isinstance(storage, LocalStorage):
-        path = storage._path(key)
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="Artifact is missing")
-        return FileResponse(path, media_type="application/json" if cameras else "application/octet-stream")
-    return StreamingResponse(
-        storage.iter_bytes(key),
-        media_type="application/json" if cameras else "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600"},
-    )
+    path = get_storage().path(key)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact is missing")
+    return FileResponse(path, media_type="application/json" if cameras else "application/octet-stream")
 
 
 @router.get("/jobs/{job_id}/scene.ply")

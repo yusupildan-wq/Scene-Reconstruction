@@ -46,7 +46,9 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
     /opt/venvs/gsplat/bin/pip install --no-deps \
       "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl"
 
-COPY . /opt/project
+COPY bootstrap /opt/project/bootstrap
+COPY scripts/execute_v3_workspace.py scripts/cache_vggt_checkpoint.py /opt/project/scripts/
+COPY experiments/run_v3_vggt.py experiments/export_gsplat_cameras.py /opt/project/experiments/
 RUN chmod +x /opt/project/bootstrap/*.sh
 WORKDIR /opt/project
 CMD ["/opt/project/bootstrap/entrypoint.sh"]

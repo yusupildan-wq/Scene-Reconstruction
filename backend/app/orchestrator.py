@@ -161,8 +161,6 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
             return
         try:
             storage = get_storage()
-            if settings.storage_backend != "local":
-                raise RuntimeError("This application keeps permanent artifacts locally; set STORAGE_BACKEND=local")
             base = f"projects/{job.project_id}/jobs/{job.id}/output"
             job.output_storage_key = job.output_storage_key or f"{base}/scene.ply"
             job.camera_storage_key = job.camera_storage_key or f"{base}/scene_cameras.json"

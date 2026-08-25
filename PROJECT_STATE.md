@@ -2,7 +2,12 @@
 
 Last updated: 2026-08-18
 
-This document is the ground-truth handoff for continuing development in a fresh Codex conversation. It combines the current repository state with verified results from the recent Colab and RunPod experiments. It deliberately distinguishes the older 32-camera office/desk experiment from the current 128-view bedroom/full-room experiment. They are different datasets and their metrics must never be compared as though they came from one run.
+> Historical snapshot. It intentionally records the earlier DUSt3R/COLMAP,
+> persistent-volume, and manual RunPod experiments; it does not describe the
+> current application architecture. For the active Local NVIDIA / temporary
+> RunPod product flow, use `README.md` and `RUNPOD_SETUP.md`.
+
+This document preserves the verified Colab and RunPod experiment state as of that date. It deliberately distinguishes the older 32-camera office/desk experiment from the 128-view bedroom/full-room experiment. They are different datasets and their metrics must never be compared as though they came from one run.
 
 ## 1. Project Purpose
 

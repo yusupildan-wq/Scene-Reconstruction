@@ -6,10 +6,10 @@ on:
       - Dockerfile
       - .dockerignore
       - "bootstrap/**"
-      - "worker/**"
       - "experiments/run_v3_vggt.py"
       - "experiments/export_gsplat_cameras.py"
       - "scripts/execute_v3_workspace.py"
+      - "scripts/cache_vggt_checkpoint.py"
       - ".github/workflows/gpu-image.yml"
 permissions:
   contents: read

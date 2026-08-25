@@ -20,7 +20,7 @@ class ProductContractTests(unittest.TestCase):
         self.assertIn("scene_url", fields)
         self.assertIn("execution_mode", fields)
 
-    def test_local_storage_streams_upload_and_reports_reusable_artifact(self):
+    def test_local_storage_saves_upload_and_reports_reusable_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = LocalStorage(directory)
             storage.save_fileobj("job/input.mp4", io.BytesIO(b"video-data"))

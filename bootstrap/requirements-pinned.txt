@@ -1,5 +1,0 @@
-# Build inputs are intentionally split because VGGT requires pycolmap 3.10.0,
-# while the official gsplat v1.5.3 trainer uses rmbrualla/pycolmap's
-# SceneManager API. See requirements-vggt.txt and requirements-gsplat.txt.
--r requirements-vggt.txt
-# requirements-gsplat.txt is installed into a separate virtual environment.
