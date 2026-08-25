@@ -97,7 +97,7 @@ function removeCameraRoll(camera: THREE.PerspectiveCamera) {
 // wall. DUSt3R doesn't canonicalize which axis is "up", so the starting
 // position is an approximation of standing in the room, not a true
 // eye-level placement on a known floor.
-export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) {
+export default function GaussianSplatViewer({ sceneUrl, onLoaded }: { sceneUrl: string; onLoaded?: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const cameraPosesRef = useRef<THREE.Matrix4[]>([]);
@@ -201,6 +201,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
       .then(([, cameraData]) => {
         if (disposed) return;
         setLoaded(true);
+        onLoaded?.();
 
         const usesOpenCvCoordinates = cameraData?.usesOpenCvCoordinates ?? false;
         usesOpenCvCoordinatesRef.current = usesOpenCvCoordinates;
@@ -325,7 +326,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
       cameraRef.current = null;
       cameraPosesRef.current = [];
     };
-  }, [sceneUrl]);
+  }, [sceneUrl, onLoaded]);
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
@@ -333,6 +334,7 @@ export default function GaussianSplatViewer({ sceneUrl }: { sceneUrl: string }) 
         ref={containerRef}
         style={{ width: "100%", height: "100%", background: "#111", cursor: isLocked ? "none" : "pointer" }}
       />
+      {!loaded && !error && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "#dce2e0", background: "#080a0c", font: "600 16px system-ui, sans-serif" }}>Loading reconstructed room…</div>}
       {loaded && hasCameraPoses && (
         <div
           onClick={(event) => event.stopPropagation()}

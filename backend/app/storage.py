@@ -33,7 +33,10 @@ class Storage(abc.ABC):
     def exists(self, key: str) -> bool: ...
 
     @abc.abstractmethod
-    def url_for(self, key: str) -> str:
+    def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024): ...
+
+    @abc.abstractmethod
+    def url_for(self, key: str, expires_seconds: int = 3600) -> str:
         """A URL the GPU worker (a different machine) can use to fetch/put this key.
 
         Raises for the local backend, since a local path is not reachable remotely.
@@ -63,7 +66,12 @@ class LocalStorage(Storage):
     def exists(self, key: str) -> bool:
         return self._path(key).is_file()
 
-    def url_for(self, key: str) -> str:
+    def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024):
+        with self._path(key).open("rb") as source:
+            while chunk := source.read(chunk_size):
+                yield chunk
+
+    def url_for(self, key: str, expires_seconds: int = 3600) -> str:
         raise RuntimeError(
             "LocalStorage keys are not reachable by a remote GPU worker. "
             "Switch STORAGE_BACKEND=s3 before dispatching jobs to RunPod."
@@ -100,9 +108,17 @@ class S3Storage(Storage):
         except self.client.exceptions.ClientError:
             return False
 
-    def url_for(self, key: str) -> str:
+    def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024):
+        body = self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
+        try:
+            while chunk := body.read(chunk_size):
+                yield chunk
+        finally:
+            body.close()
+
+    def url_for(self, key: str, expires_seconds: int = 3600) -> str:
         return self.client.generate_presigned_url(
-            "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=3600
+            "get_object", Params={"Bucket": self.bucket, "Key": key}, ExpiresIn=expires_seconds
         )
 
     def upload_url_for(self, key: str) -> str:

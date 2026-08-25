@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from app.main import app
-from app.orchestrator import _validate_viewer_artifacts
+from app.orchestrator import _runpod_progress, _validate_viewer_artifacts
 from app.storage import LocalStorage
 
 
@@ -41,6 +41,12 @@ class ProductContractTests(unittest.TestCase):
             }
             storage.save(job.camera_storage_key, json.dumps(metadata).encode())
             _validate_viewer_artifacts(job, storage)
+
+    def test_runpod_progress_accepts_json_and_list_responses(self):
+        update = {"stage": "gaussian_optimization", "progress": 72, "detail": "Training"}
+        self.assertEqual(_runpod_progress({"progress": json.dumps(update)}), update)
+        self.assertEqual(_runpod_progress({"progress": [json.dumps(update)]}), update)
+        self.assertEqual(_runpod_progress({"progress": "not-json"}), {})
 
 
 if __name__ == "__main__":

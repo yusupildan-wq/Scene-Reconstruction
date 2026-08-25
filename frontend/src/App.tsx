@@ -1,4 +1,4 @@
-import { DragEvent, useEffect, useRef, useState } from "react";
+import { DragEvent, useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE_URL, createJob, createProject, getJob, Job, listProjects, retryJob } from "./api/client";
 import GaussianSplatViewer from "./GaussianSplatViewer";
 import SceneViewer from "./SceneViewer";
@@ -14,6 +14,7 @@ const LEGACY_STAGE: Record<string, string> = {
   pending: "preparing_frames", extracting_frames: "preparing_frames", dispatched: "vggt_geometry",
   running_sfm: "vggt_geometry", training: "gaussian_optimization", complete: "finalizing",
 };
+const ACTIVE_JOB_KEY = "scene-reconstruction-active-job";
 
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -25,15 +26,28 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
+  const [viewerLoaded, setViewerLoaded] = useState(false);
   const [experimentScene, setExperimentScene] = useState("v3_scene_high.ply");
+  const handleViewerLoaded = useCallback(() => setViewerLoaded(true), []);
 
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+  useEffect(() => {
+    const savedJobId = localStorage.getItem(ACTIVE_JOB_KEY);
+    if (!savedJobId) return;
+    getJob(savedJobId).then((saved) => {
+      setJob(saved);
+      if (saved.status === "complete" && saved.scene_url) setViewerUrl(`${API_BASE_URL}${saved.scene_url}`);
+    }).catch(() => localStorage.removeItem(ACTIVE_JOB_KEY));
+  }, []);
   useEffect(() => {
     if (!job || job.status === "complete" || job.status === "failed") return;
     const timer = window.setInterval(async () => {
       try {
         const next = await getJob(job.id); setJob(next);
-        if (next.status === "complete" && next.scene_url) setViewerUrl(`${API_BASE_URL}${next.scene_url}`);
+        if (next.status === "complete") {
+          if (!next.scene_url) { setError("Reconstruction finished, but the viewer artifact is missing."); return; }
+          setViewerUrl(`${API_BASE_URL}${next.scene_url}`);
+        }
       } catch { /* transient polling failures should not discard the job */ }
     }, 1500);
     return () => window.clearInterval(timer);
@@ -54,16 +68,17 @@ export default function App() {
       const projects = await listProjects();
       const project = projects[0] ?? await createProject("My room reconstructions");
       const created = await createJob(project.id, file, setUploadPercent);
-      setJob(created); setUploadPercent(100);
+      setJob(created); localStorage.setItem(ACTIVE_JOB_KEY, created.id); setUploadPercent(100);
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setUploading(false); }
   }
   async function retry() {
     if (!job) return;
     setError(null);
-    try { setJob(await retryJob(job.id)); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    try { const retried = await retryJob(job.id); setJob(retried); localStorage.setItem(ACTIVE_JOB_KEY, retried.id); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
   }
-  function reset() { setViewerUrl(null); setJob(null); setFile(null); setPreview(null); setError(null); }
+  function reset() { localStorage.removeItem(ACTIVE_JOB_KEY); setViewerLoaded(false); setViewerUrl(null); setJob(null); setFile(null); setPreview(null); setError(null); }
 
   if (new URLSearchParams(window.location.search).has("experiments")) return <div className="viewer-shell">
     {experimentScene.endsWith(".ply") ? <GaussianSplatViewer key={experimentScene} sceneUrl={`/${experimentScene}`} />
@@ -76,8 +91,8 @@ export default function App() {
   </div>;
 
   if (viewerUrl) return <div className="viewer-shell">
-    <GaussianSplatViewer sceneUrl={viewerUrl} />
-    <div className="viewer-bar"><span>Your room</span><button onClick={reset}>New reconstruction</button></div>
+    <GaussianSplatViewer sceneUrl={viewerUrl} onLoaded={handleViewerLoaded} />
+    <div className="viewer-bar"><span>{viewerLoaded ? "Reconstruction complete" : "Opening your room…"}</span><button onClick={reset}>New reconstruction</button></div>
   </div>;
 
   const current = uploading ? "uploading" : LEGACY_STAGE[job?.status ?? ""] ?? job?.status;

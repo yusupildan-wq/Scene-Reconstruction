@@ -2,7 +2,14 @@ name: Build pinned GPU image
 on:
   workflow_dispatch:
   push:
-    paths: [Dockerfile, .dockerignore, "bootstrap/**", ".github/workflows/gpu-image.yml"]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - "bootstrap/**"
+      - "worker/**"
+      - "experiments/run_v3_vggt.py"
+      - "experiments/export_gsplat_cameras.py"
+      - ".github/workflows/gpu-image.yml"
 permissions:
   contents: read
   packages: write

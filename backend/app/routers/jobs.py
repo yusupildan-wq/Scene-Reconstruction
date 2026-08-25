@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,6 +67,7 @@ async def retry_job(job_id: uuid.UUID, background_tasks: BackgroundTasks,
     if job.status != JobStatus.FAILED:
         raise HTTPException(status_code=409, detail="Only failed jobs can be retried")
     job.status, job.error_message, job.stage_detail = JobStatus.PENDING, None, "Retrying from saved artifacts"
+    job.runpod_job_id = None
     await session.commit()
     background_tasks.add_task(run_pipeline, job.id)
     return job_out(job)
@@ -83,7 +84,11 @@ async def _artifact(job_id: uuid.UUID, cameras: bool, session: AsyncSession):
         if not path.is_file():
             raise HTTPException(status_code=404, detail="Artifact is missing")
         return FileResponse(path, media_type="application/json" if cameras else "application/octet-stream")
-    return RedirectResponse(storage.url_for(key), status_code=307)
+    return StreamingResponse(
+        storage.iter_bytes(key),
+        media_type="application/json" if cameras else "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.get("/jobs/{job_id}/scene.ply")

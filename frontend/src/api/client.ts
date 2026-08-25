@@ -12,7 +12,11 @@ export interface Job {
 }
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, init);
-  if (!response.ok) throw new Error((await response.text()) || `${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    const body = await response.text();
+    try { throw new Error(JSON.parse(body).detail || body); }
+    catch (error) { if (error instanceof SyntaxError) throw new Error(body || `${response.status} ${response.statusText}`); throw error; }
+  }
   return response.json() as Promise<T>;
 }
 export const listProjects = () => request<Project[]>("/projects");
@@ -29,7 +33,7 @@ export function createJob(projectId: string, video: File, onProgress: (percent: 
     xhr.onerror = () => reject(new Error("Upload interrupted. Check your connection and try again."));
     xhr.onload = () => xhr.status >= 200 && xhr.status < 300
       ? resolve(JSON.parse(xhr.responseText) as Job)
-      : reject(new Error(xhr.responseText || `Upload failed (${xhr.status})`));
+      : reject(new Error((() => { try { return JSON.parse(xhr.responseText).detail; } catch { return xhr.responseText; } })() || `Upload failed (${xhr.status})`));
     const form = new FormData(); form.append("video", video); xhr.send(form);
   });
 }
