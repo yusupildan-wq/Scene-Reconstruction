@@ -15,7 +15,8 @@ ENV PYTHONUNBUFFERED=1 \
     CHECKPOINT_ROOT=/workspace/checkpoints \
     HF_HOME=/workspace/cache/huggingface \
     HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface/hub \
-    TORCH_HOME=/workspace/cache/torch \
+    TORCH_HOME=/opt/cache/torch \
+    VGGT_CHECKPOINT=/opt/cache/torch/hub/checkpoints/model.pt \
     TORCH_EXTENSIONS_DIR=/workspace/cache/torch_extensions \
     PIP_CACHE_DIR=/workspace/cache/pip
 
@@ -49,6 +50,8 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
 COPY bootstrap /opt/project/bootstrap
 COPY scripts/execute_v3_workspace.py scripts/cache_vggt_checkpoint.py /opt/project/scripts/
 COPY experiments/run_v3_vggt.py experiments/export_gsplat_cameras.py /opt/project/experiments/
-RUN chmod +x /opt/project/bootstrap/*.sh
+RUN python3.10 /opt/project/scripts/cache_vggt_checkpoint.py \
+      --output /opt/cache/torch/hub/checkpoints/model.pt && \
+    chmod +x /opt/project/bootstrap/*.sh
 WORKDIR /opt/project
 CMD ["/opt/project/bootstrap/entrypoint.sh"]

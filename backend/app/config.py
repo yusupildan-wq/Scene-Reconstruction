@@ -8,11 +8,13 @@ class Settings(BaseSettings):
     storage_local_path: str = "./data/storage"
 
     runpod_api_key: str | None = None
-    runpod_image: str = "ghcr.io/yusupildan-wq/scene-reconstruction-gpu:v3-pt24-cu124-gsplat153"
+    runpod_image: str = "ghcr.io/yusupildan-wq/scene-reconstruction-gpu:v3-golden-96-vggt1b"
     runpod_gpu_type_ids: str = "NVIDIA L40S,NVIDIA RTX 6000 Ada Generation,NVIDIA RTX A6000,NVIDIA GeForce RTX 4090"
     runpod_cloud_type: str = "COMMUNITY"
     runpod_startup_timeout_seconds: int = 2400
     runpod_ssh_ready_timeout_seconds: int = 300
+    runpod_poll_interval_seconds: int = 8
+    runpod_reconnect_grace_seconds: int = 120
     runpod_container_disk_gb: int = 80
     runpod_volume_gb: int = 20
     ssh_private_key_path: str = "./data/runpod_ed25519"

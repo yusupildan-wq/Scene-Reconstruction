@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
 import tarfile
+import time
 import uuid
 from pathlib import Path
 
@@ -86,8 +88,21 @@ def _workspace(job: Job, storage, frame_keys: list[str]) -> tuple[Path, Path]:
     scene_dir, result_dir = root / "scene", root / "result"
     images_dir = scene_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
+    records = []
     for index, key in enumerate(frame_keys):
-        (images_dir / f"frame_{index:06d}.jpg").write_bytes(storage.read(key))
+        target = images_dir / f"frame_{index:04d}.jpg"
+        target.write_bytes(storage.read(key))
+        records.append({
+            "output": target.name,
+            "source_storage_key": key,
+            "bytes": target.stat().st_size,
+            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        })
+    (scene_dir / "input_manifest.json").write_text(json.dumps({
+        "selected_count": len(records),
+        "selection": "sharpest_frame_per_even_time_bin",
+        "images": records,
+    }, indent=2), encoding="utf-8")
     _restore_geometry(storage, (job.stage_artifacts or {}).get("geometry_key"), scene_dir)
     return scene_dir, result_dir
 
@@ -164,8 +179,15 @@ async def run_pipeline(job_id: uuid.UUID) -> None:
             base = f"projects/{job.project_id}/jobs/{job.id}/output"
             job.output_storage_key = job.output_storage_key or f"{base}/scene.ply"
             job.camera_storage_key = job.camera_storage_key or f"{base}/scene_cameras.json"
+            local_started = time.monotonic()
             frame_keys = await _prepare_frames(job, session, storage)
+            local_preprocessing_seconds = time.monotonic() - local_started
             await _execute(job, session, storage, frame_keys)
+            job.metrics = dict(job.metrics or {})
+            timings = dict(job.metrics.get("timings") or {})
+            timings["local_preprocessing_seconds"] = round(local_preprocessing_seconds, 3)
+            job.metrics["timings"] = timings
+            await session.commit()
             _validate_viewer_artifacts(job, storage)
             await _set(job, session, JobStatus.COMPLETE, 100, "Ready to explore")
         except Exception as exc:

@@ -11,6 +11,7 @@ import json
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 
@@ -54,11 +55,16 @@ def main() -> None:
         "--vggt-python", str(args.vggt_python), "--gsplat-python", str(args.gsplat_python),
         "--quality-profile", args.quality_profile,
     ]
+    pipeline_timings = {}
+    geometry_started = time.monotonic()
     emit("vggt_geometry", 35, "Estimating cameras and room geometry")
     run(base_command + ["--stage", "geometry"], project_root)
+    pipeline_timings["vggt_seconds"] = round(time.monotonic() - geometry_started, 3)
 
+    gsplat_started = time.monotonic()
     emit("gaussian_optimization", 58, "Optimizing Gaussian appearance")
     run(base_command + ["--stage", "train"], project_root)
+    pipeline_timings["gsplat_seconds"] = round(time.monotonic() - gsplat_started, 3)
     emit("gaussian_optimization", 88, "Gaussian optimization complete")
     cameras = result_dir / "scene_cameras.json"
     run([
@@ -74,6 +80,7 @@ def main() -> None:
         archive.add(scene_dir / "sparse", arcname="sparse")
     stats = list((result_dir / "stats").glob("val_step*.json"))
     metrics = json.loads(max(stats, key=lambda p: int(p.stem.removeprefix("val_step"))).read_text()) if stats else {}
+    metrics["timings"] = pipeline_timings
     (result_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     emit("finalizing", 98, "Artifacts ready for retrieval")
 

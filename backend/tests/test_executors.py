@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,13 +58,77 @@ class ExecutorTests(unittest.TestCase):
                  patch.object(executor, "_ensure_key", return_value=(root / "key", "ssh-ed25519 test")), \
                  patch.object(executor, "_create_pod", return_value={"id": "pod-1"}), \
                  patch.object(executor, "_wait_for_ssh", return_value=("127.0.0.1", 2222)), \
+                 patch.object(executor, "_launch_reconstruction"), \
+                 patch.object(executor, "_await_reconstruction", side_effect=RuntimeError("remote failed")), \
                  patch("app.executors.runpod_pod.subprocess.run"), \
-                 patch("app.executors.runpod_pod.run_streaming", side_effect=RuntimeError("remote failed")) as run_remote, \
                  patch.object(executor, "_terminate") as terminate:
                 with self.assertRaisesRegex(RuntimeError, "remote failed"):
                     executor.execute(request, lambda *_: None)
-                self.assertIn("execute_v3_workspace.py", run_remote.call_args.args[0][-1])
                 terminate.assert_called_once_with("pod-1")
+
+    def test_runpod_launch_uses_detached_job_runner_and_shared_v3_command(self):
+        """The shared V3 command must run byte-for-byte the same; only how it's launched changed
+        (detached via run_gpu_job.sh, so it survives an SSH disconnect instead of dying with it)."""
+        executor = RunPodExecutor()
+        with patch("app.executors.runpod_pod.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+            executor._launch_reconstruction("1.2.3.4", 2222, Path("key"), Path("known_hosts"), "baseline")
+        remote_command = run.call_args.args[0][-1]
+        self.assertIn("run_gpu_job.sh reconstruct bash -c", remote_command)
+        self.assertIn("execute_v3_workspace.py", remote_command)
+        self.assertIn("verify_env.sh", remote_command)
+        self.assertIn("--quality-profile baseline", remote_command)
+        self.assertIn("WORKSPACE_ROOT=/workspace", remote_command)
+        self.assertIn("TORCH_HOME=/opt/cache/torch", remote_command)
+        self.assertIn("HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface/hub", remote_command)
+        self.assertIn("TORCH_EXTENSIONS_DIR=/workspace/cache/torch_extensions", remote_command)
+
+    def test_runpod_await_reconnects_when_ssh_drops_but_job_continues(self):
+        """A dropped SSH connection must not restart or abandon the job: it runs detached on the
+        pod, so reconnecting and resuming monitoring is correct behavior, restarting is not."""
+        executor = RunPodExecutor()
+        progress_line = "SCENE_PROGRESS " + json.dumps({"stage": "gaussian_optimization", "progress": 60, "detail": "training"})
+        success_stdout = f"some earlier log line\n{progress_line}\n" + RunPodExecutor._EXIT_MARKER + "\n0\n"
+        responses = [
+            SimpleNamespace(returncode=255, stdout="", stderr="Connection to 1.2.3.4 closed by remote host."),
+            SimpleNamespace(returncode=0, stdout=success_stdout, stderr=""),
+        ]
+        reports: list[tuple[str, int, str]] = []
+        with patch("app.executors.runpod_pod.subprocess.run", side_effect=responses), \
+             patch("app.executors.runpod_pod.time.sleep"), \
+             patch.object(executor, "_get_pod", return_value={"desiredStatus": "RUNNING"}) as get_pod:
+            executor._await_reconstruction(
+                "pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"),
+                lambda stage, pct, detail: reports.append((stage, pct, detail)),
+            )
+        get_pod.assert_called_once()
+        self.assertIn(("gaussian_optimization", 60, "training"), reports)
+
+    def test_runpod_await_fails_fast_when_pod_actually_exited(self):
+        """If RunPod itself confirms the pod died, fail immediately rather than waiting out the
+        reconnect grace period for a connection that will never come back."""
+        executor = RunPodExecutor()
+        with patch("app.executors.runpod_pod.subprocess.run",
+                   return_value=SimpleNamespace(returncode=255, stdout="", stderr="Connection reset by peer")), \
+             patch("app.executors.runpod_pod.time.sleep") as sleep_mock, \
+             patch.object(executor, "_get_pod", return_value={"desiredStatus": "EXITED"}):
+            with self.assertRaisesRegex(RuntimeError, "RunPod pod exited"):
+                executor._await_reconstruction("pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"), lambda *_: None)
+        sleep_mock.assert_not_called()
+
+    def test_runpod_await_gives_up_after_reconnect_grace_period(self):
+        """An SSH connection that never comes back, and a pod RunPod's API can't confirm is dead
+        either, must still fail within a bounded budget instead of polling forever."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        with patch("app.executors.runpod_pod.subprocess.run",
+                   return_value=SimpleNamespace(returncode=255, stdout="", stderr="")), \
+             patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", return_value={"desiredStatus": "RUNNING"}), \
+             patch.object(settings, "runpod_reconnect_grace_seconds", 20), \
+             patch.object(settings, "runpod_poll_interval_seconds", 5):
+            with self.assertRaisesRegex(RuntimeError, "could not reconnect"):
+                executor._await_reconstruction("pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"), lambda *_: None)
 
     def test_runpod_wait_for_ssh_fails_fast_when_pod_exits(self):
         """A pod RunPod itself reports as EXITED/TERMINATED is a real failure, not a slow cold start."""

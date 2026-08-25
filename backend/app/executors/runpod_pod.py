@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -10,7 +13,7 @@ import requests
 
 from app.config import settings
 from app.executors.base import ExecutionRequest, ExecutionResult, ProviderCapability, ProgressReporter
-from app.executors.process import run_streaming
+from app.executors.process import PREFIX
 
 API = "https://rest.runpod.io/v1"
 
@@ -84,6 +87,11 @@ class RunPodExecutor:
     # pulling a multi-gigabyte CUDA image.
     _FAILED_POD_STATUSES = {"EXITED", "TERMINATED"}
 
+    # Paths written by bootstrap/run_gpu_job.sh for the detached "reconstruct" job.
+    _REMOTE_LOG = "/workspace/logs/reconstruct.log"
+    _REMOTE_EXIT = "/workspace/bootstrap/state/jobs/reconstruct.exit"
+    _EXIT_MARKER = "---RECONSTRUCT_EXIT---"
+
     def _wait_for_ssh(self, pod_id: str, private_key: Path, known_hosts: Path, report: ProgressReporter) -> tuple[str, int]:
         provisioning_deadline = time.monotonic() + settings.runpod_startup_timeout_seconds
         ssh_deadline: float | None = None
@@ -119,15 +127,124 @@ class RunPodExecutor:
                 report("vggt_geometry", 32, "Waiting for temporary RunPod GPU to finish provisioning (image download can take a while)")
             time.sleep(5)
 
+    # A degrading connection (not a clean drop) can otherwise sit silent for a
+    # long time before either side notices; these make the SSH client itself
+    # detect and give up on a dead session within ~30s instead of relying on
+    # a stall to eventually surface on its own.
+    _KEEPALIVE_OPTS = ["-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"]
+
     @staticmethod
     def _ssh_base(host: str, port: int, key: Path, known_hosts: Path) -> list[str]:
         return ["ssh", "-p", str(port), "-i", str(key), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                *RunPodExecutor._KEEPALIVE_OPTS,
                 "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known_hosts}", f"root@{host}"]
 
     @staticmethod
     def _scp_base(port: int, key: Path, known_hosts: Path) -> list[str]:
         return ["scp", "-P", str(port), "-i", str(key), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                *RunPodExecutor._KEEPALIVE_OPTS,
                 "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known_hosts}"]
+
+    def _launch_reconstruction(self, host: str, port: int, private_key: Path, known_hosts: Path, quality_profile: str) -> None:
+        pipeline = (
+            "export WORKSPACE_ROOT=/workspace "
+            "HF_HOME=/workspace/cache/huggingface "
+            "HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface/hub "
+            "TORCH_EXTENSIONS_DIR=/workspace/cache/torch_extensions; "
+            "if [ -s /opt/cache/torch/hub/checkpoints/model.pt ]; then "
+            "export TORCH_HOME=/opt/cache/torch VGGT_CHECKPOINT=/opt/cache/torch/hub/checkpoints/model.pt; "
+            "else export TORCH_HOME=/workspace/cache/torch VGGT_CHECKPOINT=/workspace/cache/torch/hub/checkpoints/model.pt; fi; "
+            "rm -rf /workspace/job && mkdir -p /workspace/job && "
+            "tar -xzf /workspace/input.tar.gz -C /workspace/job && "
+            "/opt/venvs/vggt/bin/python /opt/project/scripts/cache_vggt_checkpoint.py "
+            "--output $VGGT_CHECKPOINT && "
+            "/opt/project/bootstrap/verify_env.sh && "
+            "/opt/venvs/gsplat/bin/python /opt/project/scripts/execute_v3_workspace.py "
+            "--project-root /opt/project --scene-dir /workspace/job/scene --result-dir /workspace/job/result "
+            "--vggt-root /opt/vggt --gsplat-root /opt/gsplat --vggt-python /opt/venvs/vggt/bin/python "
+            f"--gsplat-python /opt/venvs/gsplat/bin/python --quality-profile {quality_profile} && "
+            "tar -czf /workspace/output.tar.gz -C /workspace/job/result "
+            "scene.ply scene_cameras.json vggt_geometry.tar.gz metrics.json"
+        )
+        # run_gpu_job.sh nohup's this with stdin from /dev/null and writes a PID
+        # file, a log file, and an exit-status file on the pod, so the pipeline
+        # keeps running (and stays inspectable) even if this SSH session drops.
+        # It also no-ops if the same job name is already running, so retrying
+        # this launch call itself is safe.
+        launch = f"/opt/project/bootstrap/run_gpu_job.sh reconstruct bash -c {shlex.quote(pipeline)}"
+        command = self._ssh_base(host, port, private_key, known_hosts) + [launch]
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                subprocess.run(command, check=True, timeout=30)
+                return
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                last_error = error
+                time.sleep(3)
+        raise RuntimeError(f"Could not launch the reconstruction job on the RunPod pod: {last_error}")
+
+    def _await_reconstruction(
+        self, pod_id: str, host: str, port: int, private_key: Path, known_hosts: Path, report: ProgressReporter,
+    ) -> dict[str, float]:
+        poll = f"cat {self._REMOTE_LOG} 2>/dev/null; echo {self._EXIT_MARKER}; cat {self._REMOTE_EXIT} 2>/dev/null"
+        command = self._ssh_base(host, port, private_key, known_hosts) + [poll]
+        seen_lines = 0
+        reconnect_deadline: float | None = None
+        monitoring_started = time.monotonic()
+        first_pipeline_progress: float | None = None
+        while True:
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                connected = result.returncode == 0
+            except subprocess.TimeoutExpired:
+                connected, result = False, None
+
+            if not connected:
+                # SSH itself failed to reach the pod. That alone doesn't tell us
+                # whether the pod died or the connection just blipped, so ask
+                # RunPod directly before giving up: a real EXITED/TERMINATED pod
+                # fails fast here instead of waiting out the reconnect budget,
+                # while an ambiguous "can't reach it right now" keeps retrying —
+                # the reconstruction itself is unaffected either way, since it
+                # runs detached from this SSH session.
+                pod = self._get_pod(pod_id)
+                if pod.get("desiredStatus") in self._FAILED_POD_STATUSES:
+                    raise RuntimeError(
+                        f"RunPod pod exited (status={pod.get('desiredStatus')}) while the reconstruction was running"
+                    )
+                if reconnect_deadline is None:
+                    reconnect_deadline = time.monotonic() + settings.runpod_reconnect_grace_seconds
+                    report("vggt_geometry", 34, "Lost connection to temporary RunPod GPU; reconnecting")
+                elif time.monotonic() >= reconnect_deadline:
+                    raise RuntimeError(
+                        "Lost the SSH connection to the RunPod pod and could not reconnect within "
+                        f"{settings.runpod_reconnect_grace_seconds}s; the pod may be unreachable"
+                    )
+                time.sleep(settings.runpod_poll_interval_seconds)
+                continue
+
+            reconnect_deadline = None
+            log_text, _, exit_text = result.stdout.partition(self._EXIT_MARKER)
+            lines = log_text.splitlines()
+            for line in lines[seen_lines:]:
+                print(line, flush=True)
+                if line.startswith(PREFIX):
+                    update = json.loads(line[len(PREFIX):])
+                    if first_pipeline_progress is None:
+                        first_pipeline_progress = time.monotonic()
+                    report(update["stage"], int(update["progress"]), update["detail"])
+            seen_lines = len(lines)
+
+            exit_text = exit_text.strip()
+            if exit_text:
+                if int(exit_text.splitlines()[0]) != 0:
+                    raise RuntimeError("Reconstruction command failed:\n" + "\n".join(lines[-10:]))
+                completed = time.monotonic()
+                return {
+                    "remote_setup_seconds": round((first_pipeline_progress or completed) - monitoring_started, 3),
+                    "remote_job_seconds": round(completed - monitoring_started, 3),
+                }
+            time.sleep(settings.runpod_poll_interval_seconds)
 
     def execute(self, request: ExecutionRequest, report: ProgressReporter) -> ExecutionResult:
         capability = self.validate()
@@ -137,37 +254,39 @@ class RunPodExecutor:
         transfer_dir = request.result_dir.parent
         known_hosts = transfer_dir / "runpod_known_hosts"
         input_archive = transfer_dir / "runpod_input.tar.gz"
+        packaging_started = time.monotonic()
         with tarfile.open(input_archive, "w:gz") as archive:
             archive.add(request.scene_dir, arcname="scene")
+        timings: dict[str, float] = {
+            "local_packaging_seconds": round(time.monotonic() - packaging_started, 3),
+        }
 
         pod_id: str | None = None
         succeeded = False
+        execution_result: ExecutionResult | None = None
+        paid_started: float | None = None
         try:
             report("vggt_geometry", 30, "Provisioning temporary RunPod GPU")
+            provisioning_started = time.monotonic()
             pod = self._create_pod(public_key, request.job_id)
             pod_id = str(pod["id"])
+            paid_started = time.monotonic()
             if self.on_pod_created:
                 self.on_pod_created(pod_id)
             host, port = self._wait_for_ssh(pod_id, private_key, known_hosts, report)
+            timings["pod_provisioning_seconds"] = round(time.monotonic() - provisioning_started, 3)
             report("vggt_geometry", 33, "Transferring prepared frames to RunPod")
-            subprocess.run(self._scp_base(port, private_key, known_hosts) + [str(input_archive), f"root@{host}:/workspace/input.tar.gz"], check=True)
-
-            remote = (
-                "rm -rf /workspace/job && mkdir -p /workspace/job && "
-                "tar -xzf /workspace/input.tar.gz -C /workspace/job && "
-                "/opt/venvs/vggt/bin/python /opt/project/scripts/cache_vggt_checkpoint.py "
-                "--output /workspace/cache/torch/hub/checkpoints/model.pt && "
-                "/opt/project/bootstrap/verify_env.sh && "
-                "/opt/venvs/gsplat/bin/python /opt/project/scripts/execute_v3_workspace.py "
-                "--project-root /opt/project --scene-dir /workspace/job/scene --result-dir /workspace/job/result "
-                "--vggt-root /opt/vggt --gsplat-root /opt/gsplat --vggt-python /opt/venvs/vggt/bin/python "
-                f"--gsplat-python /opt/venvs/gsplat/bin/python --quality-profile {request.quality_profile} && "
-                "tar -czf /workspace/output.tar.gz -C /workspace/job/result "
-                "scene.ply scene_cameras.json vggt_geometry.tar.gz metrics.json"
+            input_transfer_started = time.monotonic()
+            subprocess.run(
+                self._scp_base(port, private_key, known_hosts) + [str(input_archive), f"root@{host}:/workspace/input.tar.gz"],
+                check=True, timeout=1800,
             )
+            timings["input_transfer_seconds"] = round(time.monotonic() - input_transfer_started, 3)
+
             report("vggt_geometry", 34, "Preparing the remote VGGT model")
             try:
-                run_streaming(self._ssh_base(host, port, private_key, known_hosts) + [remote], Path.cwd(), report)
+                self._launch_reconstruction(host, port, private_key, known_hosts, request.quality_profile)
+                timings.update(self._await_reconstruction(pod_id, host, port, private_key, known_hosts, report))
             except Exception:
                 # Preserve completed VGGT geometry even when gsplat fails so a
                 # retry does not pay for geometry a second time.
@@ -176,26 +295,32 @@ class RunPodExecutor:
                 subprocess.run(
                     self._ssh_base(host, port, private_key, known_hosts) +
                     ["tar -czf /workspace/geometry-on-failure.tar.gz -C /workspace/job/scene sparse"],
-                    capture_output=True,
+                    capture_output=True, timeout=60,
                 )
                 subprocess.run(
                     self._scp_base(port, private_key, known_hosts) +
                     [f"root@{host}:/workspace/geometry-on-failure.tar.gz", str(geometry)],
-                    capture_output=True,
+                    capture_output=True, timeout=300,
                 )
                 raise
             report("finalizing", 96, "Downloading completed scene")
             output_archive = transfer_dir / "runpod_output.tar.gz"
-            subprocess.run(self._scp_base(port, private_key, known_hosts) + [f"root@{host}:/workspace/output.tar.gz", str(output_archive)], check=True)
+            retrieval_started = time.monotonic()
+            subprocess.run(
+                self._scp_base(port, private_key, known_hosts) + [f"root@{host}:/workspace/output.tar.gz", str(output_archive)],
+                check=True, timeout=1800,
+            )
             request.result_dir.mkdir(parents=True, exist_ok=True)
             with tarfile.open(output_archive, "r:gz") as archive:
                 archive.extractall(request.result_dir)
+            timings["artifact_retrieval_seconds"] = round(time.monotonic() - retrieval_started, 3)
             succeeded = True
-            return ExecutionResult(
+            execution_result = ExecutionResult(
                 request.result_dir / "scene.ply", request.result_dir / "scene_cameras.json",
                 request.result_dir / "vggt_geometry.tar.gz", request.result_dir / "metrics.json", pod_id,
             )
         finally:
+            active_error = sys.exc_info()[0] is not None
             if pod_id:
                 try:
                     # Only claim "finalizing"/99% once the run actually reached that
@@ -204,6 +329,21 @@ class RunPodExecutor:
                     # that then stuck around as a stale high-water mark for a retry.
                     if succeeded:
                         report("finalizing", 99, "Terminating temporary RunPod GPU")
+                    termination_started = time.monotonic()
                     self._terminate(pod_id)
+                    timings["pod_termination_seconds"] = round(time.monotonic() - termination_started, 3)
+                    if paid_started is not None:
+                        timings["paid_runpod_seconds"] = round(time.monotonic() - paid_started, 3)
                 except Exception as cleanup_error:
-                    raise RuntimeError(f"RunPod cleanup failed for pod {pod_id}: {cleanup_error}") from cleanup_error
+                    if active_error:
+                        print(f"RunPod cleanup also failed for pod {pod_id}: {cleanup_error}", file=sys.stderr)
+                    else:
+                        raise RuntimeError(f"RunPod cleanup failed for pod {pod_id}: {cleanup_error}") from cleanup_error
+            metrics_path = request.result_dir / "metrics.json"
+            if metrics_path.is_file():
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                metrics["timings"] = {**dict(metrics.get("timings") or {}), **timings}
+                metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+        if execution_result is None:
+            raise RuntimeError("RunPod reconstruction finished without an execution result")
+        return execution_result

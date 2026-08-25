@@ -10,6 +10,8 @@ frontend/dist/
 frontend/vite*.log
 frontend/public/v3_scene.ply
 frontend/public/v3_scene_high.ply
+frontend/public/img1705_scene.ply
+frontend/public/img1705_scene_cameras.json
 *.tsbuildinfo
 
 .DS_Store
