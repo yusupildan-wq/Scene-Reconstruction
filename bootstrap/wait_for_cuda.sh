@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # instead of a blind sleep or a single one-shot check.
 
 python_bin="${1:?usage: wait_for_cuda.sh <python-executable>}"
-max_attempts="${CUDA_READY_MAX_ATTEMPTS:-12}"
+max_attempts="${CUDA_READY_MAX_ATTEMPTS:-60}"
 poll_seconds="${CUDA_READY_POLL_SECONDS:-5}"
 
 echo "--- CUDA/NVIDIA environment diagnostics ---"
