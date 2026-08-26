@@ -30,7 +30,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/scene-reconstruction-gpu
           tags: |
-            type=raw,value=v3-golden-96-vggt1b
+            type=raw,value=v3-pt24-cu124-gsplat153
             type=sha
       - uses: docker/build-push-action@v6
         with:

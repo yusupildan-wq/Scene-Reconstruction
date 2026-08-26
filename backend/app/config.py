@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     storage_local_path: str = "./data/storage"
 
     runpod_api_key: str | None = None
-    runpod_image: str = "ghcr.io/yusupildan-wq/scene-reconstruction-gpu:v3-golden-96-vggt1b"
+    runpod_image: str = "ghcr.io/yusupildan-wq/scene-reconstruction-gpu:v3-pt24-cu124-gsplat153"
     runpod_gpu_type_ids: str = "NVIDIA GeForce RTX 4090"
     runpod_cloud_type: str = "COMMUNITY"
     runpod_startup_timeout_seconds: int = 2400
