@@ -5,6 +5,7 @@ ARG VGGT_COMMIT=a288dd0f14786c93483e45524328726ab7b1b4ce
 ARG GSPLAT_COMMIT=937e29912570c372bed6747a5c9bf85fed877bae
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     MAX_JOBS=2 \
     TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
@@ -33,18 +34,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3.10 -m pip install --no-cache-dir --upgrade "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1" && \
     python3.10 -m pip install --no-cache-dir \
       torch==2.4.1 torchvision==0.19.1 \
-      --index-url https://download.pytorch.org/whl/cu124
+      --index-url https://download.pytorch.org/whl/cu124 && \
+    find /usr/local/lib/python3.10/dist-packages -name '__pycache__' -type d -exec rm -rf {} + && \
+    find /usr/local/lib/python3.10/dist-packages -name '*.pyc' -delete
 
-# .git metadata (history, packed objects) is measured at 230MB combined across both
-# clones and is never read after checkout -- vggt is later pip installed with -e
-# (editable), which imports directly from this directory's *source files*, so only
-# .git itself is safe to remove here, not the checked-out tree.
+# .git metadata (history, packed objects, 230MB combined) is never read after
+# checkout -- vggt is later pip installed with -e (editable), which imports
+# directly from this directory's *source files*, so only .git itself is removed
+# here, not the checked-out tree. examples/docs/tests/assets/.github/profiling are
+# each confirmed unreferenced by anything under /opt/project (grepped) -- they're
+# upstream demo media and doc/CI sources, not code our pipeline imports or invokes.
 RUN git clone https://github.com/facebookresearch/vggt.git /opt/vggt && \
     git -C /opt/vggt checkout "$VGGT_COMMIT" && \
-    rm -rf /opt/vggt/.git && \
+    rm -rf /opt/vggt/.git /opt/vggt/examples && \
     git clone https://github.com/nerfstudio-project/gsplat.git /opt/gsplat && \
     git -C /opt/gsplat checkout "$GSPLAT_COMMIT" && \
-    rm -rf /opt/gsplat/.git
+    rm -rf /opt/gsplat/.git /opt/gsplat/docs /opt/gsplat/assets /opt/gsplat/tests \
+           /opt/gsplat/.github /opt/gsplat/profiling
 
 COPY bootstrap/requirements-vggt.txt /opt/bootstrap/requirements-vggt.txt
 COPY bootstrap/requirements-gsplat.txt /opt/bootstrap/requirements-gsplat.txt
@@ -55,7 +61,9 @@ RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
     python3.10 -m venv --system-site-packages /opt/venvs/gsplat && \
     /opt/venvs/gsplat/bin/pip install --no-cache-dir -r /opt/bootstrap/requirements-gsplat.txt && \
     /opt/venvs/gsplat/bin/pip install --no-cache-dir --no-deps \
-      "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl"
+      "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl" && \
+    find /opt/venvs -name '__pycache__' -type d -exec rm -rf {} + && \
+    find /opt/venvs -name '*.pyc' -delete
 
 COPY bootstrap /opt/project/bootstrap
 COPY scripts/execute_v3_workspace.py scripts/cache_vggt_checkpoint.py /opt/project/scripts/
