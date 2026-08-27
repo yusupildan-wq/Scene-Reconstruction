@@ -29,8 +29,13 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository_owner }}/scene-reconstruction-gpu
+          # TEMPORARY: validating the pip-cache/git-metadata size optimization under
+          # its own tag before promoting it. v3-pt24-cu124-gsplat153 (the known-good
+          # tag RUNPOD_IMAGE currently points at) is deliberately left untouched here
+          # so it stays an instant rollback target. Revert this tag list once the
+          # slim image is validated and promoted.
           tags: |
-            type=raw,value=v3-pt24-cu124-gsplat153
+            type=raw,value=v3-pt24-cu124-gsplat153-slim
             type=sha
       - uses: docker/build-push-action@v6
         with:

@@ -25,25 +25,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mkdir -p /run/sshd && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3.10 -m pip install --upgrade "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1" && \
-    python3.10 -m pip install \
+# --no-cache-dir everywhere below: PIP_CACHE_DIR is set as an image-wide ENV above,
+# so every pip install here would otherwise leave a second, unpacked copy of every
+# downloaded wheel sitting in /workspace/cache/pip -- measured at 2.4GB of pure waste
+# on the current published image, never read by anything at runtime. This changes
+# nothing about which packages or versions get installed.
+RUN python3.10 -m pip install --no-cache-dir --upgrade "pip==24.3.1" "setuptools==75.6.0" "wheel==0.45.1" && \
+    python3.10 -m pip install --no-cache-dir \
       torch==2.4.1 torchvision==0.19.1 \
       --index-url https://download.pytorch.org/whl/cu124
 
+# .git metadata (history, packed objects) is measured at 230MB combined across both
+# clones and is never read after checkout -- vggt is later pip installed with -e
+# (editable), which imports directly from this directory's *source files*, so only
+# .git itself is safe to remove here, not the checked-out tree.
 RUN git clone https://github.com/facebookresearch/vggt.git /opt/vggt && \
     git -C /opt/vggt checkout "$VGGT_COMMIT" && \
+    rm -rf /opt/vggt/.git && \
     git clone https://github.com/nerfstudio-project/gsplat.git /opt/gsplat && \
-    git -C /opt/gsplat checkout "$GSPLAT_COMMIT"
+    git -C /opt/gsplat checkout "$GSPLAT_COMMIT" && \
+    rm -rf /opt/gsplat/.git
 
 COPY bootstrap/requirements-vggt.txt /opt/bootstrap/requirements-vggt.txt
 COPY bootstrap/requirements-gsplat.txt /opt/bootstrap/requirements-gsplat.txt
 
 RUN python3.10 -m venv --system-site-packages /opt/venvs/vggt && \
-    /opt/venvs/vggt/bin/pip install -r /opt/bootstrap/requirements-vggt.txt && \
-    /opt/venvs/vggt/bin/pip install --no-deps -e /opt/vggt && \
+    /opt/venvs/vggt/bin/pip install --no-cache-dir -r /opt/bootstrap/requirements-vggt.txt && \
+    /opt/venvs/vggt/bin/pip install --no-cache-dir --no-deps -e /opt/vggt && \
     python3.10 -m venv --system-site-packages /opt/venvs/gsplat && \
-    /opt/venvs/gsplat/bin/pip install -r /opt/bootstrap/requirements-gsplat.txt && \
-    /opt/venvs/gsplat/bin/pip install --no-deps \
+    /opt/venvs/gsplat/bin/pip install --no-cache-dir -r /opt/bootstrap/requirements-gsplat.txt && \
+    /opt/venvs/gsplat/bin/pip install --no-cache-dir --no-deps \
       "https://github.com/nerfstudio-project/gsplat/releases/download/v1.5.3/gsplat-1.5.3%2Bpt24cu124-cp310-cp310-linux_x86_64.whl"
 
 COPY bootstrap /opt/project/bootstrap
