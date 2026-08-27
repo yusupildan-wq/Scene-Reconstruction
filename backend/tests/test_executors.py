@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 from app.config import settings
 from app.executors.base import ExecutionRequest, ProviderCapability
 from app.executors.local_nvidia import LocalNvidiaExecutor
@@ -102,6 +104,80 @@ class ExecutorTests(unittest.TestCase):
             )
         get_pod.assert_called_once()
         self.assertIn(("gaussian_optimization", 60, "training"), reports)
+
+    def test_runpod_await_survives_transient_get_pod_error_during_reconnect(self):
+        """RunPod's own status API can blip (e.g. a transient 404) independent of whether the
+        pod is actually alive; that must not be treated as proof of a dead pod."""
+        executor = RunPodExecutor()
+        progress_line = "SCENE_PROGRESS " + json.dumps({"stage": "gaussian_optimization", "progress": 60, "detail": "training"})
+        success_stdout = f"{progress_line}\n" + RunPodExecutor._EXIT_MARKER + "\n0\n"
+        responses = [
+            SimpleNamespace(returncode=255, stdout="", stderr="Connection reset by peer"),
+            SimpleNamespace(returncode=0, stdout=success_stdout, stderr=""),
+        ]
+        reports: list[tuple[str, int, str]] = []
+        with patch("app.executors.runpod_pod.subprocess.run", side_effect=responses), \
+             patch("app.executors.runpod_pod.time.sleep"), \
+             patch.object(executor, "_get_pod", side_effect=requests.RequestException("404")):
+            executor._await_reconstruction(
+                "pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"),
+                lambda stage, pct, detail: reports.append((stage, pct, detail)),
+            )
+        self.assertIn(("gaussian_optimization", 60, "training"), reports)
+
+    def test_runpod_wait_for_ssh_survives_transient_get_pod_error(self):
+        """A transient failure to query RunPod's status API must not be treated as a dead pod;
+        it should keep polling within the provisioning budget."""
+        executor = RunPodExecutor()
+        clock = _FakeClock()
+        pods = [
+            requests.RequestException("503"),
+            {"desiredStatus": "RUNNING", "publicIp": "1.2.3.4", "portMappings": {"22": 2222}},
+        ]
+        with patch("app.executors.runpod_pod.time.monotonic", side_effect=clock.monotonic), \
+             patch("app.executors.runpod_pod.time.sleep", side_effect=clock.sleep), \
+             patch.object(executor, "_get_pod", side_effect=pods), \
+             patch("app.executors.runpod_pod.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+            host, port = executor._wait_for_ssh("pod-1", Path("key"), Path("known_hosts"), lambda *_: None)
+        self.assertEqual((host, port), ("1.2.3.4", 2222))
+
+    def test_runpod_await_poll_command_does_not_fail_on_missing_exit_file(self):
+        """The remote poll command must always exit 0 for a healthy SSH connection,
+        even while the job is still running and its exit-status file doesn't exist
+        yet -- `cat` on a missing file returns 1, and without a trailing `true` that
+        became the whole command's exit status, making every poll of a perfectly
+        healthy in-progress job look identical to a dropped connection."""
+        executor = RunPodExecutor()
+        with patch("app.executors.runpod_pod.subprocess.run",
+                   return_value=SimpleNamespace(returncode=0, stdout=RunPodExecutor._EXIT_MARKER + "\n0\n", stderr="")) as run, \
+             patch.object(executor, "_get_pod", return_value={"desiredStatus": "RUNNING"}):
+            executor._await_reconstruction(
+                "pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"), lambda *_: None,
+            )
+        remote_command = run.call_args.args[0][-1]
+        self.assertTrue(remote_command.rstrip().endswith("true"))
+
+    def test_runpod_await_reconnects_to_reassigned_endpoint(self):
+        """RunPod can remap a pod's public IP/port under it (observed after a launch);
+        the reconnect loop must pick up the new endpoint instead of retrying the stale
+        one for the whole grace period."""
+        executor = RunPodExecutor()
+        progress_line = "SCENE_PROGRESS " + json.dumps({"stage": "gaussian_optimization", "progress": 60, "detail": "training"})
+        success_stdout = f"{progress_line}\n" + RunPodExecutor._EXIT_MARKER + "\n0\n"
+        responses = [
+            SimpleNamespace(returncode=255, stdout="", stderr="Connection timed out"),
+            SimpleNamespace(returncode=0, stdout=success_stdout, stderr=""),
+        ]
+        with patch("app.executors.runpod_pod.subprocess.run", side_effect=responses) as run, \
+             patch("app.executors.runpod_pod.time.sleep"), \
+             patch.object(executor, "_get_pod",
+                           return_value={"desiredStatus": "RUNNING", "publicIp": "5.6.7.8", "portMappings": {"22": 9999}}):
+            executor._await_reconstruction(
+                "pod-1", "1.2.3.4", 2222, Path("key"), Path("known_hosts"), lambda *_: None,
+            )
+        second_command = run.call_args_list[1].args[0]
+        self.assertTrue(any("5.6.7.8" in part for part in second_command))
+        self.assertIn("9999", second_command)
 
     def test_runpod_await_fails_fast_when_pod_actually_exited(self):
         """If RunPod itself confirms the pod died, fail immediately rather than waiting out the

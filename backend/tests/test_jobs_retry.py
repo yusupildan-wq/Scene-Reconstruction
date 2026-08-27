@@ -24,7 +24,7 @@ class RetryJobTests(unittest.TestCase):
             runpod_job_id="pod-1", input_storage_key="k", execution_mode="runpod",
             created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
         )
-        session = SimpleNamespace(get=AsyncMock(return_value=job), commit=AsyncMock())
+        session = SimpleNamespace(get=AsyncMock(return_value=job), commit=AsyncMock(), refresh=AsyncMock())
         background_tasks = BackgroundTasks()
         with patch("app.routers.jobs.run_pipeline"):
             asyncio.run(retry_job(job.id, background_tasks, session))

@@ -108,7 +108,16 @@ class RunPodExecutor:
                     "RunPod pod network became reachable but SSH never came up within "
                     f"{settings.runpod_ssh_ready_timeout_seconds}s; the pod likely failed to start correctly"
                 )
-            pod = self._get_pod(pod_id)
+            try:
+                pod = self._get_pod(pod_id)
+            except requests.RequestException as error:
+                # RunPod's own API is occasionally flaky (a transient 404/5xx on a pod
+                # that is still very much alive), independent of the pod's own boot
+                # progress. Treat that as "still waiting", not as proof the pod died --
+                # only desiredStatus itself is a real failure signal.
+                report("vggt_geometry", 32, f"RunPod status check failed transiently ({error}); retrying")
+                time.sleep(5)
+                continue
             status = pod.get("desiredStatus")
             if status in self._FAILED_POD_STATUSES:
                 raise RuntimeError(f"RunPod pod exited during startup (status={status}) before it became reachable")
@@ -186,18 +195,30 @@ class RunPodExecutor:
     def _await_reconstruction(
         self, pod_id: str, host: str, port: int, private_key: Path, known_hosts: Path, report: ProgressReporter,
     ) -> dict[str, float]:
-        poll = f"cat {self._REMOTE_LOG} 2>/dev/null; echo {self._EXIT_MARKER}; cat {self._REMOTE_EXIT} 2>/dev/null"
-        command = self._ssh_base(host, port, private_key, known_hosts) + [poll]
+        # The trailing `; true` matters: without it, this remote command's own exit
+        # status is whatever the last `cat` returned, and `cat` on the exit-status
+        # file returns 1 (No such file) for the entire time the job is still running
+        # (the file doesn't exist yet). That made every poll of an actually-healthy,
+        # still-running job look identical to a dropped SSH connection -- the "lost
+        # connection" path was firing on the very first poll after every launch, not
+        # on any real network failure. Whether the job is actually done is decided
+        # below from the parsed exit marker/text, not from this command's exit code.
+        poll = f"cat {self._REMOTE_LOG} 2>/dev/null; echo {self._EXIT_MARKER}; cat {self._REMOTE_EXIT} 2>/dev/null; true"
         seen_lines = 0
         reconnect_deadline: float | None = None
         monitoring_started = time.monotonic()
         first_pipeline_progress: float | None = None
+        last_failure: str | None = None
         while True:
+            command = self._ssh_base(host, port, private_key, known_hosts) + [poll]
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=30)
                 connected = result.returncode == 0
+                if not connected:
+                    last_failure = (result.stderr or "").strip() or f"ssh exited with code {result.returncode}"
             except subprocess.TimeoutExpired:
                 connected, result = False, None
+                last_failure = "ssh connection attempt timed out after 30s"
 
             if not connected:
                 # SSH itself failed to reach the pod. That alone doesn't tell us
@@ -206,19 +227,36 @@ class RunPodExecutor:
                 # fails fast here instead of waiting out the reconnect budget,
                 # while an ambiguous "can't reach it right now" keeps retrying —
                 # the reconstruction itself is unaffected either way, since it
-                # runs detached from this SSH session.
-                pod = self._get_pod(pod_id)
+                # runs detached from this SSH session. A transient failure to even
+                # query RunPod's API is treated the same as "can't confirm it's dead"
+                # rather than propagating and aborting the whole job.
+                try:
+                    pod = self._get_pod(pod_id)
+                except requests.RequestException:
+                    pod = {}
                 if pod.get("desiredStatus") in self._FAILED_POD_STATUSES:
                     raise RuntimeError(
                         f"RunPod pod exited (status={pod.get('desiredStatus')}) while the reconstruction was running"
                     )
+                # RunPod can remap a pod's public IP/SSH port under it (observed: a pod that
+                # connected fine once then had every reconnect attempt fail against the same
+                # address for the whole grace period). Re-read the pod's current endpoint on
+                # every failed attempt instead of hammering a possibly-stale host:port for the
+                # entire reconnect window.
+                new_ip = pod.get("publicIp")
+                new_mappings = pod.get("portMappings") or {}
+                new_port = new_mappings.get("22") or new_mappings.get(22)
+                if new_ip and new_port and (str(new_ip), int(new_port)) != (host, port):
+                    report("vggt_geometry", 34, f"RunPod reassigned the pod's network endpoint; reconnecting to {new_ip}:{new_port}")
+                    host, port = str(new_ip), int(new_port)
                 if reconnect_deadline is None:
                     reconnect_deadline = time.monotonic() + settings.runpod_reconnect_grace_seconds
                     report("vggt_geometry", 34, "Lost connection to temporary RunPod GPU; reconnecting")
                 elif time.monotonic() >= reconnect_deadline:
                     raise RuntimeError(
                         "Lost the SSH connection to the RunPod pod and could not reconnect within "
-                        f"{settings.runpod_reconnect_grace_seconds}s; the pod may be unreachable"
+                        f"{settings.runpod_reconnect_grace_seconds}s; the pod may be unreachable "
+                        f"(last error: {last_failure})"
                     )
                 time.sleep(settings.runpod_poll_interval_seconds)
                 continue

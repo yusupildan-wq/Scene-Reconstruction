@@ -91,6 +91,7 @@ async def retry_job(job_id: uuid.UUID, background_tasks: BackgroundTasks,
     # into the retry's UI as a stale percentage that doesn't match the resumed stage.
     job.progress_percent = 0
     await session.commit()
+    await session.refresh(job)
     background_tasks.add_task(run_pipeline, job.id)
     return job_out(job)
 
